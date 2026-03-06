@@ -126,7 +126,7 @@ class QNet(nn.Module):
             hidden_size = 4096  # default or error handling
 
         # Create an instance of the model with required initial parameters
-        model = cls(hidden_size, args, accelerator, no_load=True)
+        model = cls(hidden_size, args, accelerator, no_load=True, model_args=args)
 
         # Load the state dict
         state_dict_path = os.path.join(load_directory, "pytorch_model.bin")

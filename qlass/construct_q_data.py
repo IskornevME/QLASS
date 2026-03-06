@@ -9,6 +9,7 @@ sys.path.append(root_dir)
 sys.path.append((Path(root_dir).parent))
 import pickle
 from tqdm import tqdm
+from qlass.explore_sft_agent import TreeNode
 
 def combine_jsonl(input_files, output_file):
     combined_data = []

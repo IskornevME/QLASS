@@ -111,6 +111,7 @@ def main(args: argparse.Namespace):
     all_tasks, n_tasks = task_class.load_tasks(args.split, args.part_num, args.part_idx)
     
     # initialize the agent
+    print(agent_config["config"])
     agent: agents.LMAgent = getattr(agents, agent_config["agent_class"])(
         agent_config["config"]
     )

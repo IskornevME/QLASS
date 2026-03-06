@@ -18,7 +18,8 @@ import matplotlib.pyplot as plt
 import pickle
 import random
 import copy
-from model.q_network import QNet
+# from model.q_network import QNet
+from qlass.q_network import QNet
 
 try:
     from eval.hotpotqa.zeno_build.models import lm_config

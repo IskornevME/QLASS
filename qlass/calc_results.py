@@ -5,8 +5,8 @@ import os
 data_dir = './data/train/alfworld/'
 model_name = 'qlass-Llama-2-7b-chat-hf-alfworld-sft'
 inference_type = 'q_without_perturb'
-eval_name = 'debug_bon2_dev'
-slice_num = 4
+eval_name = 'debug_bon2_test_run_0'
+slice_num = 1
 file_list = []
 for i in range(slice_num):
     file_path = os.path.join(data_dir, model_name, inference_type, eval_name, f"{i}of{slice_num}_slices_bon_traj.jsonl")
@@ -61,3 +61,4 @@ for file in file_list:
 print("avg total max:", total_max / total_max_list)
 print("avg total first:", total_first / total_first_list)
 print("avg total bon:", total_bon / total_bon_list)
+print("num tasks:", total_bon_list)

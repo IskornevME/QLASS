@@ -83,14 +83,30 @@ class TrainingArguments(transformers.TrainingArguments):
 
 
 def trainer_save_model_safe(trainer: transformers.Trainer):
-    from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-    from torch.distributed.fsdp import StateDictType, FullStateDictConfig
+    try:
+        from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+        from torch.distributed.fsdp import StateDictType, FullStateDictConfig
 
-    save_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
-    with FSDP.state_dict_type(
-        trainer.model, StateDictType.FULL_STATE_DICT, save_policy
-    ):
+        # Если реально FSDP - сохраняем через FULL_STATE_DICT как у авторов
+        if isinstance(trainer.model, FSDP):
+            save_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+            with FSDP.state_dict_type(trainer.model, StateDictType.FULL_STATE_DICT, save_policy):
+                trainer.save_model()
+        else:
+            trainer.save_model()
+    except Exception:
+        # single GPU / без FSDP
         trainer.save_model()
+
+# def trainer_save_model_safe(trainer: transformers.Trainer):
+#     from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+#     from torch.distributed.fsdp import StateDictType, FullStateDictConfig
+
+#     save_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+#     with FSDP.state_dict_type(
+#         trainer.model, StateDictType.FULL_STATE_DICT, save_policy
+#     ):
+#         trainer.save_model()
 
 
 class SupervisedDataset_Q(Dataset):

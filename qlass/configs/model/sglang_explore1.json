@@ -1,7 +1,7 @@
 {
     "agent_class": "SGLangAgent",
     "config": {
-        "server_address": "http://localhost:21002",
+        "server_address": "http://localhost:21003",
         "model_name": "llama-7b-chat-hf",
         "max_new_tokens": 512,
         "temperature": 2.0,
