@@ -1,3 +1,4 @@
+import os
 import re
 import json
 import logging
@@ -21,10 +22,18 @@ class SciWorldEnv(BaseEnv):
         env: ScienceWorldEnv,
         **kwargs,
     ):
+        # Keep a copy of max_steps from config (e.g. sciworld.json has max_steps=40)
+        cfg_max_steps = kwargs.get("max_steps", None)
+        # Optional extra cap: allow overriding for paper setups (e.g. explore=18, eval=40)
+        paper_max_steps_cap = kwargs.pop("paper_max_steps_cap", None)
+    
         super().__init__(**kwargs)
         self.task: SciWorldTask = task
         self.env = env
         self.max_steps_dict = json.load(open("eval_agent/data/sciworld/max_steps.json"))
+
+        # берем максимальное число шагов из конфига
+        self._cfg_max_steps = int(cfg_max_steps) if cfg_max_steps is not None else None
         
         self.state = State()
     
@@ -91,7 +100,20 @@ class SciWorldEnv(BaseEnv):
     
     def reset(self,num_icl_examples=1) -> Tuple[str, State]:
         self.state = State()
-        self.max_steps = self.max_steps_dict[self.task.sub_task_name]
+        # self.max_steps = self.max_steps_dict[self.task.sub_task_name]
+
+
+        task_max_steps = int(self.max_steps_dict[self.task.sub_task_name])
+
+        # Start from task-specific cap, then apply config cap (sciworld.json),
+        # then apply optional paper cap if provided.
+        effective_max_steps = task_max_steps
+        if self._cfg_max_steps is not None:
+            effective_max_steps = max(effective_max_steps, self._cfg_max_steps)
+
+        # self.max_steps = effective_max_steps
+        self.max_steps = self._cfg_max_steps
+
         self.env.load(self.task.sub_task_name, self.task.variation_idx, simplificationStr="easy", generateGoldPath=False)
         obs, info = self.env.reset()
         cur_task = info['taskDesc']

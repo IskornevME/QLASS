@@ -2,11 +2,11 @@
 import json
 import os
 
-data_dir = './data/train/sciworld/'
-model_name = 'qlass-Llama-2-7b-chat-hf-sciworld-sft_run1'
+data_dir = './data/train/alfworld/'
+model_name = 'qlass-Llama-2-7b-chat-hf-alfworld-sft_run1'
 inference_type = 'q_without_perturb'
-eval_name = 'debug_bon2_dev_run_6'
-slice_num = 1
+eval_name = 'debug_bon2_test'
+slice_num = 2
 file_list = []
 for i in range(slice_num):
     file_path = os.path.join(data_dir, model_name, inference_type, eval_name, f"{i}of{slice_num}_slices_bon_traj.jsonl")

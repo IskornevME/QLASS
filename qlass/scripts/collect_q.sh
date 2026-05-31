@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-task=alfworld  # webshop, scienceworld, alfworld
+task=sciworld  # webshop, scienceworld, alfworld
 
 # ВАЖНО: реальный output_dir от exploration
-data_path="data/train/${task}/explore_7b_sft_d8_i0_s2_mpr3"
+data_path="data/train/${task}/explore_7b_sft_d6_i0_s2_mpr3_v2"
 exp_name=qlass
 
 # Куда construct_q_data.py сохранит итог: data/train/<task>/explore/<q_type>.jsonl
-mkdir -p "data/train/${task}/explore"
+mkdir -p "data/train/${task}/explore_v2"
 
 # Чтобы при перезапуске не было дублей (скрипт подхватывает ВСЕ .jsonl/.pkl в data_path)
 rm -f "${data_path}/combined_traj.jsonl" \

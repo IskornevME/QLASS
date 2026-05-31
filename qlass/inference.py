@@ -13,6 +13,10 @@ import qlass.envs as envs
 from qlass.utils import State
 
 
+import transformers
+from qlass.data_utils import get_chat_template
+
+
 logger = logging.getLogger("agent_frame")
 
 N_DEBUG_EXAMPLES = 5
@@ -21,6 +25,23 @@ def debug_logging_info(msg: str, debug: bool):
     if debug:
         logger.info(msg)
     return
+
+
+def resolve_tokenizer_path(model_name: str) -> str:
+    if os.path.exists(model_name):
+        return model_name
+    model_root = os.environ.get("MODEL_PATH", "")
+    if model_root:
+        candidate = os.path.join(model_root, model_name)
+        if os.path.exists(candidate):
+            return candidate
+    return model_name
+
+
+def build_prompt_from_history(model_name: str, history: list[dict]) -> str:
+    chat = get_chat_template(model_name)
+    return chat.get_prompt(history + [{"role": "assistant", "content": None}])
+
     
 def interactive_loop(
     args: argparse.Namespace,
@@ -28,6 +49,8 @@ def interactive_loop(
     agent: agents.LMAgent,
     env_config: Dict[str, Any],
     debug: bool = False,
+    tokenizer=None,
+    prompt_stats_dir: str | None = None,
 ) -> State:
     debug_logging_info(f"Loading environment: {env_config['env_class']}", debug)
     env: envs.BaseEnv = getattr(envs, env_config["env_class"])(task, **env_config)
@@ -37,20 +60,49 @@ def interactive_loop(
     # reset the environment and set the prompt
     observation, state = env.reset(args.num_icl_examples)
 
+    print(
+        f"[DBG_STEPS] task={task.task_id} "
+        f"after reset: env.max_steps={getattr(env, 'max_steps', None)} "
+        f"state.steps={getattr(state, 'steps', None)} "
+        f"finished={getattr(state, 'finished', None)}"
+    )
+
 
     init_msg = observation
 
     debug_logging_info(f"\n{Fore.YELLOW}{init_msg}{Fore.RESET}", debug)
 
     cur_step = 1
+    prompt_stats = []
     # import ipdb;ipdb.set_trace()
     while not state.finished:
         debug_logging_info(f"\n{Fore.RED}Step {cur_step}{Fore.RESET}\n", debug)
         cur_step += 1
         # agent act
         try:
+
+            if tokenizer is not None:
+                prompt = build_prompt_from_history(agent.model_name, state.history)
+                prompt_tokens = len(tokenizer(prompt, add_special_tokens=True).input_ids)
+                stat = {
+                    "task_id": task.task_id,
+                    "step": cur_step,
+                    "history_turns": len(state.history),
+                    "prompt_tokens": prompt_tokens,
+                }
+                prompt_stats.append(stat)
+                logger.info(
+                    f"[PROMPT_STATS] task={task.task_id} step={cur_step} "
+                    f"history_turns={len(state.history)} prompt_tokens={prompt_tokens}"
+                )
+
+
             llm_output: str = agent(state.history)
             debug_logging_info(f"\n{Fore.GREEN}{llm_output}{Fore.RESET}\n", debug)
+
+            if tokenizer is not None:
+                response_tokens = len(tokenizer(llm_output, add_special_tokens=False).input_ids)
+                prompt_stats[-1]["response_tokens"] = response_tokens
         except Exception as e:
             logger.info(f"Agent failed with error: {e}")
             state.success = False
@@ -59,6 +111,17 @@ def interactive_loop(
             break
         # environment step
         observation, state = env.step(llm_output)
+
+        print(
+            f"[DBG_STEPS] task={task.task_id} "
+            f"cur_step={cur_step-1} "
+            f"state.steps={getattr(state, 'steps', None)} "
+            f"env.max_steps={getattr(env, 'max_steps', None)} "
+            f"finished={getattr(state, 'finished', None)} "
+            f"success={getattr(state, 'success', None)} "
+            f"terminate_reason={getattr(state, 'terminate_reason', None)}"
+        )
+
         if not state.finished:
             # color the observation in blue
             debug_logging_info(f"\n{Fore.BLUE}{observation}{Fore.RESET}\n", debug)
@@ -69,7 +132,22 @@ def interactive_loop(
         debug_logging_info(f"Task finished in {state.steps} steps. Success: {state.success}. Reward: {state.reward}", debug)
     else:
         debug_logging_info(f"Task finished in {state.steps} steps. Success: {state.success}", debug)
+
+    print(
+        f"[DBG_DONE] task={task.task_id} "
+        f"final_steps={getattr(state, 'steps', None)} "
+        f"env.max_steps={getattr(env, 'max_steps', None)} "
+        f"success={getattr(state, 'success', None)} "
+        f"terminate_reason={getattr(state, 'terminate_reason', None)} "
+        f"reward={getattr(state, 'reward', None)}"
+    )
         
+
+    if prompt_stats_dir is not None:
+        with open(os.path.join(prompt_stats_dir, f"{task.task_id}_prompt_stats.json"), "w") as f:
+            json.dump(prompt_stats, f, indent=2)
+
+
     return state
 
 
@@ -116,6 +194,20 @@ def main(args: argparse.Namespace):
         agent_config["config"]
     )
 
+
+    tokenizer = None
+    prompt_stats_dir = None
+    if args.log_prompt_lengths:
+        tokenizer_path = args.tokenizer_path or resolve_tokenizer_path(agent_config["config"]["model_name"])
+        print(f"[PROMPT_STATS] loading tokenizer from: {tokenizer_path}")
+        tokenizer = transformers.AutoTokenizer.from_pretrained(
+            tokenizer_path,
+            use_fast=False,
+        )
+        prompt_stats_dir = os.path.join(output_path, "prompt_stats")
+        pathlib.Path(prompt_stats_dir).mkdir(parents=True, exist_ok=True)
+
+
     state_list = []
 
     done_task_id = []
@@ -148,8 +240,13 @@ def main(args: argparse.Namespace):
             if task.task_id in done_task_id or str(task.task_id) in done_task_id:
                 continue
 
+            # state = interactive_loop(
+            #     args, task, agent, env_config, args.debug
+            # )
             state = interactive_loop(
-                args, task, agent, env_config, args.debug
+                args, task, agent, env_config, args.debug,
+                tokenizer=tokenizer,
+                prompt_stats_dir=prompt_stats_dir,
             )
 
             state_list.append(state)
@@ -267,6 +364,17 @@ if __name__ == "__main__":
         type=str,
         default='top_k=-1',
         help="evaluation setting notes")
+    parser.add_argument(
+        "--log_prompt_lengths",
+        action="store_true",
+        help="Log prompt token lengths for each step."
+    )
+    parser.add_argument(
+        "--tokenizer_path",
+        type=str,
+        default=None,
+        help="Optional explicit tokenizer/model path for prompt length logging."
+    )
     args = parser.parse_args()
     
     if args.verbose:

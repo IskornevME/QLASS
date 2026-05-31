@@ -73,6 +73,8 @@ def perturb_messages_for_webshop(instruction, messages):
 def perturb_messages_for_sciworld(instruction, messages):
     raise NotImplementedError("We do not support the task to perturb messages: sciworld")
 
+
+
 def perturb_messages_for_alfworld(instruction, messages):
     raise NotImplementedError("We do not support the task to perturb messages: alfworld")
 
@@ -89,22 +91,119 @@ def perturb_messages(instruction, messages, task_name="webshop"):
 @torch.no_grad()
 def evaluate_trajs_qnet_v2(model, tokenizer, new_state, batch_size=1, disable_tqdm=False, model_name='/mnt/model/Llama-2-7b-chat-hf/', debug=False):
     q_values = []
-    sources = [new_state.to_dict()['conversations'][:-1]]
-    if not disable_tqdm:
-        progress = tqdm.tqdm(total=len(sources), desc="Evaluating Trajectories")
+    # sources = [new_state.to_dict()['conversations'][:-1]]
+    # if not disable_tqdm:
+    #     progress = tqdm.tqdm(total=len(sources), desc="Evaluating Trajectories")
+    conv = new_state.to_dict()['conversations']
+    # We want the last message to be the GPT action (no following observation)
+    if conv and conv[-1].get("from") == "human":
+        conv = conv[:-1]
+    sources = [conv]
     device = next(model.parameters()).device
     
     from qlass.data_utils import preprocess
-    data_dict = preprocess(sources, tokenizer, model_name, [0. for i in range(len(sources))])
+    # data_dict = preprocess(sources, tokenizer, model_name, [0. for i in range(len(sources))])
+    # -------- QNet-safe trimming to avoid losing the tail via HF truncation --------
+    # Keep first 3 messages, then drop oldest turns (2 msgs) until prompt fits.
+    from qlass.data_utils import get_chat_template
+    chat = get_chat_template(model_name)
+
+    def _prompt_tokens(convs):
+        # convert conversations -> messages for prompt building
+        roles = {"human": "user", "gpt": "assistant"}
+        roles_list = ["user", "assistant"]
+        src = convs
+        if roles[src[0]["from"]] != "user":
+            src = src[1:]
+        msgs = []
+        for j, s in enumerate(src):
+            role = roles[s["from"]]
+            assert role == roles_list[j % 2]
+            msgs.append({"role": role, "content": s["value"]})
+        prompt = chat.get_prompt(msgs + [{"role": "assistant", "content": None}])
+        return len(tokenizer(prompt, add_special_tokens=True).input_ids)
+
+    max_prompt_tokens = getattr(tokenizer, "model_max_length", 4096)
+    # Use CLI caps if present (added below), else defaults
+    max_prompt_tokens = min(max_prompt_tokens, getattr(model, "_qnet_max_prompt_tokens", 3800))
+    keep_first_n = getattr(model, "_qnet_keep_first_n", 3)
+    min_tail_msgs = getattr(model, "_qnet_min_tail_msgs", 4)
+
+    trimmed = sources[0]
+    n_tok = _prompt_tokens(trimmed)
+    if n_tok > max_prompt_tokens and len(trimmed) > keep_first_n + min_tail_msgs:
+        prefix = trimmed[:keep_first_n]
+        rest = trimmed[keep_first_n:]
+        # remove oldest turns by 2 messages to preserve alternation
+        while n_tok > max_prompt_tokens and len(rest) > min_tail_msgs:
+            if len(rest) >= 2:
+                rest = rest[2:]
+            else:
+                break
+            trimmed = prefix + rest
+            n_tok = _prompt_tokens(trimmed)
+        sources = [trimmed]
+    # ---------------------------------------------------------------------------
+
+    # data_dict = preprocess(sources, tokenizer, model_name, [0.0 for _ in range(len(sources))])
     
+    # for i in range(0, len(sources), batch_size):
+    #     batch_input_ids = data_dict['input_ids'][i:i + batch_size].to(device)
+    #     attention_mask = data_dict['attention_mask'][i:i + batch_size].to(device)
+    #     # QNet forward pass
+    #     q_output = model(batch_input_ids, attention_mask=attention_mask)
+    #     # Assuming QNet returns a single scalar per example as Q-value
+    #     # import pdb; pdb.set_trace()
+    #     batch_q_values = q_output[:,-1].squeeze().tolist()  # Ensure it's a list
+    #     if isinstance(batch_q_values, float):
+    #         batch_q_values = [batch_q_values]
+
+    #     q_values.extend(batch_q_values)
+
+    # ---- Force left truncation as a safety net (keeps tail, avoids >4096) ----
+    old_side = getattr(tokenizer, "truncation_side", "right")
+    old_max_len = getattr(tokenizer, "model_max_length", 4096)
+    tokenizer.truncation_side = "left"
+    tokenizer.model_max_length = max_prompt_tokens
+
+    data_dict = preprocess(sources, tokenizer, model_name, [0.0 for _ in range(len(sources))])
+
+    # restore tokenizer settings
+    tokenizer.truncation_side = old_side
+    tokenizer.model_max_length = old_max_len
+    # ------------------------------------------------------------------------
+
     for i in range(0, len(sources), batch_size):
         batch_input_ids = data_dict['input_ids'][i:i + batch_size].to(device)
         attention_mask = data_dict['attention_mask'][i:i + batch_size].to(device)
-        # QNet forward pass
+
         q_output = model(batch_input_ids, attention_mask=attention_mask)
-        # Assuming QNet returns a single scalar per example as Q-value
-        # import pdb; pdb.set_trace()
-        batch_q_values = q_output[:,-1].squeeze().tolist()  # Ensure it's a list
+
+        # unwrap outputs if needed
+        if isinstance(q_output, (tuple, list)):
+            q_output = q_output[0]
+
+        # normalize shapes to [B, T] when possible
+        if hasattr(q_output, "dim") and q_output.dim() == 3 and q_output.size(-1) == 1:
+            q_output = q_output.squeeze(-1)  # [B, T]
+
+        # Now extract per-example scalar Q safely
+        if q_output.dim() == 2:
+            # last non-pad index (safe)
+            lengths = attention_mask.long().sum(dim=1)  # [B]
+            lengths = torch.clamp(lengths, min=1)       # avoid 0 -> last_idx=-1
+            last_idx = lengths - 1
+            last_idx = torch.clamp(last_idx, min=0, max=q_output.size(1) - 1)
+
+            batch_q_values = q_output[torch.arange(q_output.size(0), device=q_output.device), last_idx]
+        elif q_output.dim() == 1:
+            # already [B]
+            batch_q_values = q_output
+        else:
+            # very defensive fallback
+            batch_q_values = q_output.reshape(q_output.size(0), -1)[:, 0]
+
+        batch_q_values = batch_q_values.detach().float().cpu().tolist()
         if isinstance(batch_q_values, float):
             batch_q_values = [batch_q_values]
 
@@ -218,11 +317,20 @@ def verify_conversations(conversations):
 # RECURSIVE_MODE = True
 # N_SFT_EXAMPLES = 1000
 
-MAX_TURNS={"webshop":5,"scienceworld":15,"alfworld":40}
+MAX_TURNS={"webshop":5,"sciworld":40,"alfworld":40}
 N_SAMPLE = 3
 # N_TRAJS = 3
 EPSILON = 0.1
 TOPK = 2
+
+
+def _force_min_max_steps(env, min_steps: int):
+    """SciWorld reset can overwrite env.max_steps (e.g. from max_steps.json). Force it back."""
+    cur = getattr(env, "max_steps", None)
+    if cur is None:
+        env.max_steps = int(min_steps)
+    else:
+        env.max_steps = int(max(int(cur), int(min_steps)))
 
 
 def main(args):
@@ -237,24 +345,39 @@ def main(args):
     qnet = QNet.from_pretrained(args.qnet_path,None,args)
     qnet = qnet.to("cuda")
     qnet.device = torch.device("cuda")
-    
+
+    qnet.mode = "final"
+    qnet.eval()
+
     print("loaded qnet successfully")
+    # from transformers import AutoTokenizer
+    # tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path,
+    #                                             model_max_length=4096,
+    #                                             use_fast=False)
+    # Tokenizer MUST match the SFT model (same chat template/tokenizer as action generator)
     from transformers import AutoTokenizer
-    tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path,
-                                                model_max_length=4096,
-                                                use_fast=False)
+    # Resolve tokenizer path: explicit arg > agent_config tokenizer_path > args.model_name
+    with open(os.path.join(args.agent_path, f"{args.agent_config}.json")) as f:
+        agent_config: Dict[str, Any] = json.load(f)
+    tokenizer_path = args.tokenizer_path or agent_config.get("config", {}).get("tokenizer_path") or args.model_name
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, model_max_length=4096, use_fast=False)
     if tokenizer.pad_token != tokenizer.unk_token:
         tokenizer.pad_token = tokenizer.unk_token
     random.seed(42)
 
     with open(os.path.join(args.exp_path, f"{args.exp_config}.json")) as f:
         exp_config: Dict[str, Any] = json.load(f)
-    with open(os.path.join(args.agent_path, f"{args.agent_config}.json")) as f:
-        agent_config: Dict[str, Any] = json.load(f)
+    # with open(os.path.join(args.agent_path, f"{args.agent_config}.json")) as f:
+    #     agent_config: Dict[str, Any] = json.load(f)
         
     if args.model_name is not None:
         agent_config['config']['model_name'] = args.model_name
         agent_config['config']['batch_size'] = args.eval_batch_size
+
+    # Attach QNet trimming caps to the model instance (used inside evaluate_trajs_qnet_v2)
+    qnet._qnet_max_prompt_tokens = args.qnet_max_prompt_tokens
+    qnet._qnet_keep_first_n = args.qnet_keep_first_n
+    qnet._qnet_min_tail_msgs = args.qnet_min_tail_msgs
         
     env_config = exp_config["env_config"]
     logger.info(f"Experiment config: \n{json.dumps(exp_config, indent=2)}")
@@ -282,6 +405,7 @@ def main(args):
     traj_file = args.output_dir+f"{args.slice_id}of{args.slice_num}_slices_{args.sample_mode}_traj.jsonl"
     tree_file =args.output_dir+f"{args.slice_id}of{args.slice_num}_slices_{args.sample_mode}_tree.pkl"
     
+    turn_cap = MAX_TURNS[args.exp_config]   # for sciworld => 40
 
     done_task_id = []
     mult_success_num = 0
@@ -300,7 +424,18 @@ def main(args):
                 continue
             
             env: envs.BaseEnv = getattr(envs, env_config["env_class"])(task, **env_config)
-            env.max_steps = MAX_TURNS[args.exp_config]
+
+            print(
+                f"[DBG_MAX_STEPS] BEFORE override: "
+                f"args.exp_config={args.exp_config} "
+                f"env_config.max_steps={env_config.get('max_steps', None)} "
+                f"env.max_steps={getattr(env, 'max_steps', None)} "
+                f"MAX_TURNS={MAX_TURNS.get(args.exp_config, None)}"
+            )
+
+            env.max_steps = _force_min_max_steps(env, turn_cap)
+
+            print(f"[DBG_MAX_STEPS] AFTER override: env.max_steps={getattr(env, 'max_steps', None)}")
 
             if args.force_first:
                 env.icl_format = 'first'
@@ -310,7 +445,9 @@ def main(args):
             elif env.icl_format == 'conversation':
                 start_i = 2
 
-            init_msg, state = env.reset(num_icl_examples=args.num_icl_examples) 
+            init_msg, state = env.reset(num_icl_examples=args.num_icl_examples)
+            _force_min_max_steps(env, turn_cap)
+            print(f"[DBG_MAX_STEPS] AFTER reset#0 (forced): env.max_steps={getattr(env,'max_steps',None)}")
 
             root = TreeNode(state=init_msg, action='No Action (Root)', reward=state.reward) 
             
@@ -320,8 +457,13 @@ def main(args):
             num_success = 0 
             for traj_id in range(args.n_trajs):
                 init_msg , cur_traj_state = env.reset(num_icl_examples=args.num_icl_examples)
+
+                _force_min_max_steps(env, turn_cap)
+                print(f"[DBG_MAX_STEPS] AFTER reset(traj{traj_id}) (forced): env.max_steps={getattr(env,'max_steps',None)}")
+
                 action_value_list = []
-                for n_turn in range(MAX_TURNS[args.exp_config]):
+                # for n_turn in range(turn_cap):
+                for n_turn in range(env.max_steps):
                     new_state_candidates = []
                     if n_turn==0:
                         current_node=root
@@ -331,14 +473,42 @@ def main(args):
                     # Sampling N actions and select the best one
                     for idx in range(args.best_of_N):
                         # import ipdb; ipdb.set_trace()
-                        observation, state = env.reset(num_icl_examples=args.num_icl_examples) 
-                        if n_turn >0:
-                            for i in range(start_i,n_turn+start_i):
-                                action = cur_traj_state.history[i*2-1]['content']
-                                observation, state = env.step(action)
+                        # observation, state = env.reset(num_icl_examples=args.num_icl_examples) 
+                        # if n_turn >0:
+                        #     for i in range(start_i,n_turn+start_i):
+                        #         action = cur_traj_state.history[i*2-1]['content']
+                        #         observation, state = env.step(action)
         
-                        assert state.history==cur_traj_state.history, f"state.history: {state.history}\ncur_traj_state.history: {cur_traj_state.history} mismatch"
-                    
+                        # assert state.history==cur_traj_state.history, f"state.history: {state.history}\ncur_traj_state.history: {cur_traj_state.history} mismatch"
+
+                        def extract_assistant_action_msgs(history):
+                            out = []
+                            for msg in history:
+                                if msg["role"] != "assistant":
+                                    continue
+                                text = msg["content"].strip()
+                                # берем именно те сообщения, которые реально шли в env.step (с Thought/Action или numeric disambiguation)
+                                if ("Action:" in text) or text.isdigit():
+                                    out.append(text)
+                            return out
+                        
+                        observation, state = env.reset(num_icl_examples=args.num_icl_examples)
+                        _force_min_max_steps(env, turn_cap)
+
+                        if n_turn > 0:
+                            prefix_actions = extract_assistant_action_msgs(cur_traj_state.history)[:n_turn]
+                            for act_text in prefix_actions:
+                                observation, state = env.step(act_text)
+
+                        replay_actions = extract_assistant_action_msgs(state.history)
+                        traj_actions = extract_assistant_action_msgs(cur_traj_state.history)
+
+                        assert replay_actions == traj_actions, (
+                            f"[REPLAY ACTION MISMATCH] n_turn={n_turn}\n"
+                            f"replay_actions={replay_actions}\n"
+                            f"traj_actions={traj_actions}\n"
+                        )
+
                         if (not idx) or args.disable_perturb:
                             cur_state_history = cur_traj_state.history
                         else:
@@ -366,7 +536,10 @@ def main(args):
                             Q_value = evaluate_trajs_qnet_v2(qnet, tokenizer, new_state, batch_size=1, disable_tqdm=True, model_name=args.model_name, debug=args.debug)[0]
                             new_state_candidates.append((new_state,Q_value))
                             action_value_dict.append({"action": action, "value": Q_value})
-                            
+
+                            if i < 2 and n_turn < 3:
+                                print(f"[DBG] idx={idx} Q={Q_value:.4f} action={action.splitlines()[-1][:120]}")
+
                     # Select the best action from candidates based on the Q-values 
                     if args.sample_mode == 'epsilon_greedy':
                         if random.random() < EPSILON :  # Noted that this is not leakage, just a stopping signal from the model itself
@@ -381,13 +554,26 @@ def main(args):
                         raise NotImplementedError(f"We do not support the sample mode: {args.sample_mode}")
                     
                     action_value_list.append(action_value_dict)
-                    new_state, reward = selected_traj
-                    new_node = TreeNode(state=new_state.to_dict()['conversations'][:-2], action=new_state.to_dict()['conversations'][-2], reward= reward)
+                    # new_state, reward = selected_traj
+                    # new_node = TreeNode(state=new_state.to_dict()['conversations'][:-2], action=new_state.to_dict()['conversations'][-2], reward= reward)
+                    new_state, chosen_score = selected_traj  # chosen_score = Q_value (если не finished) или env reward (если finished)
+                    new_node = TreeNode(
+                        state=new_state.to_dict()['conversations'][:-2],
+                        action=new_state.to_dict()['conversations'][-2],
+                        reward=new_state.reward,   # всегда “настоящая” reward среды
+                    )
+                    new_node.q_value = float(chosen_score)
                     assert isinstance(new_state.to_dict()['conversations'][-2], dict) and new_state.to_dict()['conversations'][-2]['from']=='gpt'
                     current_node.add_child(new_node)
                     current_node = new_node
                     cur_traj_state = new_state
                     if cur_traj_state.finished:
+                        print(
+                            f"[DBG_DONE] finished at n_turn={n_turn+1} "
+                            f"env.max_steps={getattr(env,'max_steps',None)} "
+                            f"state.steps={getattr(cur_traj_state,'steps',None)} "
+                            f"terminate_reason={getattr(cur_traj_state,'terminate_reason',None)}"
+                        )
                         break
                 all_trajs.append(
                     {
@@ -515,7 +701,7 @@ if __name__ == "__main__":
         "--disable_perturb",
         action="store_true",
         help="Whether to disable perturbation of messages.",
-    ),
+    )
     parser.add_argument(
         "--debug",
         action="store_true",
@@ -571,6 +757,17 @@ if __name__ == "__main__":
         type=int,
         default=3,
         help="Number of best trajectories to select.")
+
+    # --- Added: QNet scoring trimming caps (to match your SGLangAgent behavior) ---
+    parser.add_argument("--tokenizer_path", type=str, default=None,
+                        help="Tokenizer/SFT model path. If not set, will use agent_config['config']['tokenizer_path'] or --model_name.")
+    parser.add_argument("--qnet_max_prompt_tokens", type=int, default=3800,
+                        help="Max prompt tokens for QNet scoring (message-level trimming).")
+    parser.add_argument("--qnet_keep_first_n", type=int, default=3,
+                        help="Keep first N messages when trimming for QNet scoring.")
+    parser.add_argument("--qnet_min_tail_msgs", type=int, default=4,
+                        help="Keep at least this many last messages when trimming for QNet scoring.")
+
     args = parser.parse_args()
     if args.verbose:
         logger.setLevel(logging.INFO)

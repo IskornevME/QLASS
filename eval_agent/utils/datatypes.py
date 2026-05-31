@@ -52,26 +52,49 @@ class State:
     def empty(self):
         return len(self.history) == 0
 
-    def to_dict(self, format="fastchat") -> Dict[str, Any]:
+    def to_dict(self, format="fastchat"):
         if format == 'openai':
             history = deepcopy(self.history)
+
         elif format == 'fastchat':
-            history = []
-            for idx, conv in enumerate(self.history):
-                if idx % 2 == 0:
-                    assert conv['role'] == 'user'
-                    history.append({
-                        "from": "human",
-                        "value": conv['content'].strip(),
-                    })
+            normalized = []
+
+            for conv in self.history:
+                role = conv["role"]
+                content = conv["content"].strip()
+
+                if role not in {"user", "assistant", "system"}:
+                    raise ValueError(f"Unexpected role: {role}. Full history: {self.history}")
+
+                # system можно просто пропустить
+                if role == "system":
+                    continue
+
+                # склеиваем подряд идущие сообщения одной роли
+                if normalized and normalized[-1]["role"] == role:
+                    normalized[-1]["content"] += "\n" + content
                 else:
-                    assert conv['role'] == 'assistant'
-                    history.append({
-                        "from": "gpt",
-                        "value": conv['content'].strip(),
+                    normalized.append({
+                        "role": role,
+                        "content": content,
                     })
+
+            if not normalized:
+                history = []
+            else:
+                if normalized[0]["role"] != "user":
+                    raise ValueError(f"Conversation must start with user. Full history: {self.history}")
+
+                history = []
+                for conv in normalized:
+                    history.append({
+                        "from": "human" if conv["role"] == "user" else "gpt",
+                        "value": conv["content"],
+                    })
+
         else:
             raise NotImplementedError(f"Format {format} not implemented.")
+
         meta_info = {
             "steps": self.steps,
             "reward": self.reward,
@@ -80,8 +103,42 @@ class State:
             "terminate_reason": self.terminate_reason,
             "error": self.error,
         }
-        res_dict = {
+
+        return {
             "meta": meta_info,
-            "conversations": history
+            "conversations": history,
         }
-        return res_dict
+
+    # def to_dict(self, format="fastchat") -> Dict[str, Any]:
+    #     if format == 'openai':
+    #         history = deepcopy(self.history)
+    #     elif format == 'fastchat':
+    #         history = []
+    #         for idx, conv in enumerate(self.history):
+    #             if idx % 2 == 0:
+    #                 assert conv['role'] == 'user'
+    #                 history.append({
+    #                     "from": "human",
+    #                     "value": conv['content'].strip(),
+    #                 })
+    #             else:
+    #                 assert conv['role'] == 'assistant'
+    #                 history.append({
+    #                     "from": "gpt",
+    #                     "value": conv['content'].strip(),
+    #                 })
+    #     else:
+    #         raise NotImplementedError(f"Format {format} not implemented.")
+    #     meta_info = {
+    #         "steps": self.steps,
+    #         "reward": self.reward,
+    #         "finished": self.finished,
+    #         "success": self.success,
+    #         "terminate_reason": self.terminate_reason,
+    #         "error": self.error,
+    #     }
+    #     res_dict = {
+    #         "meta": meta_info,
+    #         "conversations": history
+    #     }
+    #     return res_dict

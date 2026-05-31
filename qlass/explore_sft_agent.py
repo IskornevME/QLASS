@@ -140,7 +140,7 @@ def collect_and_print_stats(node):
     print(f"Max Q Value: {max_q_value}")
 
 
-MAX_TURNS={"webshop":5,"sciworld":15,"alfworld":18}
+MAX_TURNS={"webshop":5,"sciworld":18,"alfworld":18}
 
 def main(args):
 
@@ -298,17 +298,35 @@ def main(args):
 
                 # Expand child action to samples_per_depth
                 for _ in range(len(new_action_list), explore_samples):
+                    # observation, state = env.reset(args.num_icl_examples)
+                    # cur_step = 1
+                    # # Get the corresponding state of the current node
+                    # if depth > 1:
+                    #     for cur_step in range(start_i, depth + start_i - 1):
+                    #         if cur_step < depth-1:
+                    #             action = node.state[cur_step*2-1]['value']
+                    #         else:
+                    #             action = node.action['value']
+                    #         observation, state = env.step(action)
+                    # assert not state.finished
                     observation, state = env.reset(args.num_icl_examples)
-                    cur_step = 1
-                    # Get the corresponding state of the current node
+                    reached_terminal = False
+
                     if depth > 1:
                         for cur_step in range(start_i, depth + start_i - 1):
-                            if cur_step < depth-1:
-                                action = node.state[cur_step*2-1]['value']
+                            if cur_step < depth - 1:
+                                action = node.state[cur_step*2 - 1]['value']
                             else:
                                 action = node.action['value']
+
                             observation, state = env.step(action)
-                    assert not state.finished
+
+                            if state.finished:
+                                reached_terminal = True
+                                break
+
+                    if reached_terminal:
+                        continue
 
                     # Get the input for the agent
                     if len(new_action_list)==0:
@@ -340,7 +358,14 @@ def main(args):
                         continue
                     
                     _, new_state = env.step(action)
-                    cur_state = new_state.to_dict()['conversations']
+                    # cur_state = new_state.to_dict()['conversations']
+                    try:
+                        cur_state = new_state.to_dict()['conversations']
+                    except Exception:
+                        print("BAD HISTORY:")
+                        for j, msg in enumerate(new_state.history):
+                            print(j, msg)
+                        raise
                     new_node = TreeNode(state=cur_state[:-2],action=cur_state[-2],reward=new_state.reward)
                     assert isinstance(cur_state[-2],dict) and cur_state[-2]['from']=='gpt'
                     node.add_child(new_node)
@@ -398,14 +423,29 @@ def main(args):
             # adding the sft traj and a branch
 
             for i in range(start_i, sft_state.steps+start_i):
-                new_state = sft_state.to_dict()['conversations'][:i*2]
-                new_node = TreeNode(state=new_state[:-1], action=new_state[-1], reward=sft_state.reward)
-                assert isinstance(new_state[-1],dict) and new_state[-1]['from']=='gpt'
-                if i > start_i and i <=args.max_depth:
+                # new_state = sft_state.to_dict()['conversations'][:i*2]
+                # new_node = TreeNode(state=new_state[:-1], action=new_state[-1], reward=sft_state.reward)
+                # assert isinstance(new_state[-1],dict) and new_state[-1]['from']=='gpt'
+                conv = sft_state.to_dict()['conversations'][:i*2]
+
+                if len(conv) >= 2 and conv[-1]['from'] == 'human' and conv[-2]['from'] == 'gpt':
+                    new_node = TreeNode(state=conv[:-2], action=conv[-2], reward=sft_state.reward)
+                elif len(conv) >= 1 and conv[-1]['from'] == 'gpt':
+                    new_node = TreeNode(state=conv[:-1], action=conv[-1], reward=sft_state.reward)
+                else:
+                    raise ValueError(f"Unexpected conversation suffix: {conv[-4:]}")
+
+                if i > start_i and i <= args.max_depth:
                     _, bro_state = env.reset(args.num_icl_examples)
-                    for new_i in range(start_i,i):
-                        action = new_state[new_i*2-1]['value']
-                        _,bro_state = env.step(action)
+
+                    prefix_actions = [m['value'] for m in conv if m['from'] == 'gpt']
+                    for action in prefix_actions[:-1]:
+                        _, bro_state = env.step(action)
+                        if bro_state.finished:
+                            break
+
+                    if bro_state.finished:
+                        continue
 
                     brother_action = agent(bro_state.history)
                     _, bro_state = env.step(brother_action)

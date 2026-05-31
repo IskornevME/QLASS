@@ -41,6 +41,8 @@ import transformers
 import os
 IGNORE_TOKEN_ID = LabelSmoother.ignore_index
 
+from qlass.data_utils import get_chat_template
+
 
 @dataclass
 class ModelArguments:
@@ -109,6 +111,69 @@ def trainer_save_model_safe(trainer: transformers.Trainer):
 #         trainer.save_model()
 
 
+def _to_messages(conversations):
+    roles = {"human": "user", "gpt": "assistant"}
+    roles_list = ["user", "assistant"]
+    src = conversations
+
+    if roles[src[0]["from"]] != "user":
+        src = src[1:]
+
+    msgs = []
+    for j, s in enumerate(src):
+        role = roles[s["from"]]
+        # соблюдаем чередование как в preprocess()
+        assert role == roles_list[j % 2]
+        msgs.append({"role": role, "content": s["value"]})
+    return msgs
+
+
+def _to_conversations(messages):
+    conv = []
+    for m in messages:
+        conv.append({"from": "human" if m["role"] == "user" else "gpt", "value": m["content"]})
+    return conv
+
+
+def _prompt_tokens(messages, tokenizer, chat):
+    prompt = chat.get_prompt(messages + [{"role": "assistant", "content": None}])
+    return len(tokenizer(prompt, add_special_tokens=True).input_ids)
+
+
+def trim_turns_keep_first_n(messages, tokenizer, chat, max_prompt_tokens=3800, keep_first_n=3, min_tail_msgs=4):
+    """
+    Turn-based trimming:
+      - keep first keep_first_n messages (по твоей договорённости: 3)
+      - затем удаляем САМЫЕ СТАРЫЕ turn’ы после них, всегда по 2 сообщения за раз,
+        чтобы сохранить user/assistant alternation
+      - min_tail_msgs гарантирует, что в хвосте останется минимум сообщений (обычно достаточно 4:
+        last user obs + last assistant action (+ возможно предыдущая пара))
+    """
+    if max_prompt_tokens is None:
+        return messages
+
+    n = _prompt_tokens(messages, tokenizer, chat)
+    if n <= max_prompt_tokens:
+        return messages
+
+    keep_n = min(keep_first_n, len(messages))
+    prefix = messages[:keep_n]
+    rest = messages[keep_n:]
+
+    # не трогаем хвост: оставим минимум min_tail_msgs сообщений в rest
+    # (чтобы точно не выбросить последние observation+action)
+    while n > max_prompt_tokens and len(rest) > min_tail_msgs:
+        # удаляем самый старый "turn" в rest.
+        # важно: всегда по 2 сообщения, иначе сломается чередование ролей.
+        if len(rest) >= 2:
+            rest = rest[2:]
+        else:
+            break
+        n = _prompt_tokens(prefix + rest, tokenizer, chat)
+
+    return prefix + rest
+
+
 class SupervisedDataset_Q(Dataset):
     """Dataset for supervised fine-tuning qnet."""
 
@@ -116,21 +181,46 @@ class SupervisedDataset_Q(Dataset):
         super(SupervisedDataset_Q, self).__init__()
 
         rank0_print("Formatting inputs...")
-        sources = [example["conversations"] for example in raw_data]
-        data_dict = preprocess(sources, tokenizer, model_path, [example['label'] for example in raw_data])
+
+        chat = get_chat_template(model_path)
+        max_prompt_tokens = int(3800)
+        keep_first_n = int(3)
+        min_tail_msgs = int(4)
+
+        trimmed_sources = []
+        for ex in raw_data:
+            msgs = _to_messages(ex["conversations"])
+            msgs = trim_turns_keep_first_n(
+                msgs, tokenizer=tokenizer, chat=chat,
+                max_prompt_tokens=max_prompt_tokens,
+                keep_first_n=keep_first_n,
+                min_tail_msgs=min_tail_msgs,
+            )
+            trimmed_sources.append(_to_conversations(msgs))
+
+        labels = [example["label"] for example in raw_data]
+        data_dict = preprocess(trimmed_sources, tokenizer, model_path, labels)
+
+        # data_dict = preprocess(sources, tokenizer, model_path, [example['label'] for example in raw_data])
         # save data_dict
-        self.input_ids = data_dict["input_ids"].to("cuda")
-        self.labels = data_dict["labels"].to("cuda")
-        self.attention_mask = data_dict["attention_mask"].to("cuda")
+        # self.input_ids = data_dict["input_ids"].to("cuda")
+        # self.labels = data_dict["labels"].to("cuda")
+        # self.attention_mask = data_dict["attention_mask"].to("cuda")
+        self.input_ids = data_dict["input_ids"]
+        self.labels = data_dict["labels"]
+        self.attention_mask = data_dict["attention_mask"]
         
     def __len__(self):
         return len(self.input_ids)
 
     def __getitem__(self, i) -> Dict[str, torch.Tensor]:
         return dict(
-            input_ids=self.input_ids[i].to("cuda"),
-            labels=self.labels[i].to("cuda"),
-            attention_mask=self.attention_mask[i].to("cuda"),
+            # input_ids=self.input_ids[i].to("cuda"),
+            # labels=self.labels[i].to("cuda"),
+            # attention_mask=self.attention_mask[i].to("cuda"),
+            input_ids=self.input_ids[i],
+            labels=self.labels[i],
+            attention_mask=self.attention_mask[i],
         )
 
 def make_supervised_data_module(

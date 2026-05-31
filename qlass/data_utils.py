@@ -247,30 +247,39 @@ def preprocess(
             max_length=tokenizer.model_max_length,
             truncation=True,
         ).input_ids
+    # else:
+    #     # Tokenize conversations only at rank 0 and then using all_gather to broadcast the tokenized conversations
+    #     rank = int(os.getenv('RANK', '0'))
+    #     if rank == 0:
+    #         input_ids = tokenizer(
+    #             conversations,
+    #             return_tensors="pt",
+    #             padding="max_length",
+    #             max_length=tokenizer.model_max_length,
+    #             truncation=True,
+    #         ).input_ids
+    #         # Put input_ids to the current cuda device
+    #         input_ids = input_ids.to(torch.device("cuda:0"))
+    #     else:
+    #         input_ids = torch.empty(
+    #             (len(conversations), tokenizer.model_max_length),
+    #             dtype=torch.long,
+    #             device=torch.device(f"cuda:{rank}"),
+    #         )
+
+    #     dist.broadcast(input_ids, src=0)
+
+    #     # Cast input_ids back to the cpu
+    #     input_ids = input_ids.to(torch.device("cpu"))
     else:
-        # Tokenize conversations only at rank 0 and then using all_gather to broadcast the tokenized conversations
-        rank = int(os.getenv('RANK', '0'))
-        if rank == 0:
-            input_ids = tokenizer(
-                conversations,
-                return_tensors="pt",
-                padding="max_length",
-                max_length=tokenizer.model_max_length,
-                truncation=True,
-            ).input_ids
-            # Put input_ids to the current cuda device
-            input_ids = input_ids.to(torch.device("cuda:0"))
-        else:
-            input_ids = torch.empty(
-                (len(conversations), tokenizer.model_max_length),
-                dtype=torch.long,
-                device=torch.device(f"cuda:{rank}"),
-            )
-
-        dist.broadcast(input_ids, src=0)
-
-        # Cast input_ids back to the cpu
-        input_ids = input_ids.to(torch.device("cpu"))
+        # Safer: tokenize on each rank to avoid broadcasting a huge tensor via NCCL
+        input_ids = tokenizer(
+            conversations,
+            return_tensors="pt",
+            padding="max_length",
+            max_length=tokenizer.model_max_length,
+            truncation=True,
+        ).input_ids
 
     # When no rewards are provided, we need to mask the non-assistant tokens to do SFT
     if rewards is None:

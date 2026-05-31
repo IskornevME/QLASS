@@ -243,7 +243,7 @@ def main(args):
     # Combined slices
     combine_jsonl(jsonl_files, combined_traj_file)
     combine_pkl(pkl_files, combined_tree_file)
-    q_file = 'data/train/'+args.task+'/explore/'+f'{args.q_type}.jsonl'
+    q_file = 'data/train/'+args.task+'/explore_v2/'+f'{args.q_type}.jsonl'
     
     if args.q_type == 'vanilla':
         collect_vanilla_q_data_from_trees_unpruned(combined_tree_file, q_file)
