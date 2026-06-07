@@ -18,6 +18,7 @@ import matplotlib.pyplot as plt
 import pickle
 import random
 import copy
+import re
 # from model.q_network import QNet
 from qlass.q_network import QNet
 
@@ -36,7 +37,7 @@ from qlass.explore_sft_agent import TreeNode
 import qlass.tasks as tasks
 import qlass.agents as agents
 import qlass.envs as envs
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Mapping, Optional, Sequence
 import logging
 from colorama import Fore
 from eval_agent.prompt.templates import *
@@ -333,6 +334,85 @@ def _force_min_max_steps(env, min_steps: int):
         env.max_steps = int(max(int(cur), int(min_steps)))
 
 
+
+def _append_jsonl_record(path: Optional[str], record: Mapping[str, Any]) -> None:
+    """Append one structured diagnostics record to a JSONL log."""
+    if path is None:
+        return
+    with open(path, "a", encoding="utf-8") as log_file:
+        log_file.write(json.dumps(dict(record), ensure_ascii=False) + "\n")
+
+
+def _extract_assistant_action_msgs(history: Sequence[Mapping[str, Any]]) -> List[str]:
+    """Return assistant responses that were actually submitted to the environment."""
+    actions: List[str] = []
+    for message in history:
+        if message.get("role") != "assistant":
+            continue
+        text = str(message.get("content", "")).strip()
+        if ("Action:" in text) or text.isdigit():
+            actions.append(text)
+    return actions
+
+
+def _extract_observation_for_memory(
+    history: Sequence[Mapping[str, Any]],
+    *,
+    task_text: str,
+    step_index: int,
+) -> str:
+    """Return the observation of the state before the selected action.
+
+    On step 0 the state history contains the full ICL prompt. Using the task
+    observation rather than the full prompt avoids matching on shared
+    demonstration text instead of the current task.
+    """
+    if step_index == 0:
+        return str(task_text).strip()
+
+    for message in reversed(history):
+        if message.get("role") != "user":
+            continue
+        text = str(message.get("content", "")).strip()
+        return re.sub(r"^Observation:\s*", "", text, flags=re.IGNORECASE).strip()
+
+    logger.warning(
+        "[MEMORY_OBSERVATION_MISSING] step=%d; falling back to task text.",
+        step_index,
+    )
+    return str(task_text).strip()
+
+
+def _parse_action_for_memory(
+    env: Any,
+    raw_action: str,
+    *,
+    task_id: Any,
+    attempt_id: int,
+    step_id: int,
+    candidate_id: int,
+) -> str:
+    """Parse the environment command used as an action key in memory.
+
+    ``AlfWorldEnv.step`` already handles malformed responses. Therefore a
+    parsing failure must be logged, but must not abort the whole evaluation.
+    """
+    try:
+        return str(env.parse_action(raw_action)).strip()
+    except Exception as exc:
+        fallback = re.sub(r"\s+", " ", str(raw_action).strip().lower())
+        logger.warning(
+            "[ACTION_PARSE_FAILED] task=%r attempt=%d step=%d candidate=%d "
+            "error=%s fallback=%r",
+            task_id,
+            attempt_id,
+            step_id,
+            candidate_id,
+            exc,
+            fallback,
+        )
+        return fallback
+
 def main(args):
     total_examples = []
     total_trees = []
@@ -404,6 +484,91 @@ def main(args):
     os.makedirs(args.output_dir, exist_ok=True)
     traj_file = args.output_dir+f"{args.slice_id}of{args.slice_num}_slices_{args.sample_mode}_traj.jsonl"
     tree_file =args.output_dir+f"{args.slice_id}of{args.slice_num}_slices_{args.sample_mode}_tree.pkl"
+
+
+    # JitRL-style episodic memory for correction-only inference. It is kept
+    # outside the task loop so global memory can accumulate across attempts
+    # and tasks.
+    correction_memory = None
+    memory_log_file: Optional[str] = None
+    if args.enable_memory_correction:
+        if args.exp_config != "alfworld":
+            raise ValueError(
+                "Memory correction currently supports only --exp_config alfworld."
+            )
+        if args.memory_reward_mode != "terminal_only":
+            raise ValueError(
+                "The initial correction variant supports only terminal_only rewards."
+            )
+        if args.memory_use_env_reward_fallback:
+            raise ValueError(
+                "Environment reward fallback is disabled in the initial "
+                "terminal-only correction variant."
+            )
+        if args.memory_weight < 0.0:
+            raise ValueError("--memory_weight must be non-negative.")
+
+        from qlass.alfworld_correction_memory import AlfWorldCorrectionMemory
+
+        memory_dir = args.memory_dir or os.path.join(
+            args.output_dir, "alfworld_correction_memory"
+        )
+        correction_memory = AlfWorldCorrectionMemory(
+            base_dir=memory_dir,
+            gamma=args.memory_gamma,
+            top_k=args.memory_top_k,
+            similarity_threshold=args.memory_threshold,
+            terminal_step_penalty=args.memory_terminal_step_penalty,
+            dynamic_threshold=not args.memory_disable_dynamic_threshold,
+            persist=True,
+        )
+        if args.reset_memory:
+            correction_memory.clear(delete_files=True)
+
+        memory_log_file = args.memory_log_file or os.path.join(
+            args.output_dir,
+            f"{args.slice_id}of{args.slice_num}_slices_{args.sample_mode}_"
+            "memory_correction_decisions.jsonl",
+        )
+        if args.reset_memory and os.path.exists(memory_log_file):
+            os.remove(memory_log_file)
+        _append_jsonl_record(
+            memory_log_file,
+            {
+                "record_type": "run_config",
+                "exp_config": args.exp_config,
+                "split": args.split,
+                "slice_id": args.slice_id,
+                "slice_num": args.slice_num,
+                "best_of_N": args.best_of_N,
+                "n_trajs": args.n_trajs,
+                "sample_mode": args.sample_mode,
+                "qnet_path": args.qnet_path,
+                "agent_model_name": args.model_name,
+                "memory_dir": memory_dir,
+                "memory_weight": args.memory_weight,
+                "memory_gamma": args.memory_gamma,
+                "memory_top_k": args.memory_top_k,
+                "memory_threshold": args.memory_threshold,
+                "memory_reward_mode": args.memory_reward_mode,
+                "memory_terminal_step_penalty": args.memory_terminal_step_penalty,
+                "memory_scope": args.memory_scope,
+                "memory_dynamic_threshold": not args.memory_disable_dynamic_threshold,
+                "prefer_terminal_success": args.prefer_terminal_success,
+                "memory_initial_stats": correction_memory.stats(),
+            },
+        )
+        logger.info(
+            "[MEMORY_ENABLED] dir=%s weight=%.6f gamma=%.4f top_k=%d "
+            "threshold=%.4f scope=%s initial_stats=%s",
+            memory_dir,
+            args.memory_weight,
+            args.memory_gamma,
+            args.memory_top_k,
+            args.memory_threshold,
+            args.memory_scope,
+            correction_memory.stats(),
+        )
     
     turn_cap = MAX_TURNS[args.exp_config]   # for sciworld => 40
 
@@ -422,6 +587,10 @@ def main(args):
             
             if task.task_id in done_task_id or str(task.task_id) in done_task_id:
                 continue
+
+            if correction_memory is not None and args.memory_scope == "per_task":
+                correction_memory.clear(delete_files=True)
+                logger.info("[MEMORY_RESET_PER_TASK] task_id=%r", task.task_id)
             
             env: envs.BaseEnv = getattr(envs, env_config["env_class"])(task, **env_config)
 
@@ -433,7 +602,7 @@ def main(args):
                 f"MAX_TURNS={MAX_TURNS.get(args.exp_config, None)}"
             )
 
-            env.max_steps = _force_min_max_steps(env, turn_cap)
+            _force_min_max_steps(env, turn_cap)
 
             print(f"[DBG_MAX_STEPS] AFTER override: env.max_steps={getattr(env, 'max_steps', None)}")
 
@@ -454,55 +623,63 @@ def main(args):
             instruction_path = f"{root_dir}/eval_agent/prompt/instructions/{args.exp_config}_inst.txt"
             with open(instruction_path) as f:
                 instruction = f.read()
-            num_success = 0 
+            num_success = 0
             for traj_id in range(args.n_trajs):
-                init_msg , cur_traj_state = env.reset(num_icl_examples=args.num_icl_examples)
-
+                init_msg, cur_traj_state = env.reset(
+                    num_icl_examples=args.num_icl_examples
+                )
                 _force_min_max_steps(env, turn_cap)
-                print(f"[DBG_MAX_STEPS] AFTER reset(traj{traj_id}) (forced): env.max_steps={getattr(env,'max_steps',None)}")
+                print(
+                    f"[DBG_MAX_STEPS] AFTER reset(traj{traj_id}) (forced): "
+                    f"env.max_steps={getattr(env, 'max_steps', None)}"
+                )
 
+                # This list contains only actions actually selected for the
+                # trajectory. Temporary candidate branches evaluated by QNet
+                # are never inserted into episodic memory.
+                executed_steps: List[Dict[str, Any]] = []
                 action_value_list = []
-                # for n_turn in range(turn_cap):
+                steps_with_nonzero_correction = 0
+                decisions_changed_by_memory = 0
+
                 for n_turn in range(env.max_steps):
-                    new_state_candidates = []
-                    if n_turn==0:
-                        current_node=root
-                    action_list = []
-                    action_value_dict = []
+                    if n_turn == 0:
+                        current_node = root
 
-                    # Sampling N actions and select the best one
+                    # Construct one memory query for the current pre-action
+                    # state. It is shared by all candidate actions below.
+                    task_text = str(getattr(task, "observation", "")).strip()
+                    observation_before_action = _extract_observation_for_memory(
+                        cur_traj_state.history,
+                        task_text=task_text,
+                        step_index=n_turn,
+                    )
+                    previous_action_commands = [
+                        step["action_command"] for step in executed_steps
+                    ]
+
+                    action_list: List[str] = []
+                    candidate_records: List[Dict[str, Any]] = []
+
+                    # Generate N candidates and compute their original QLASS
+                    # scores exactly as in the baseline.
                     for idx in range(args.best_of_N):
-                        # import ipdb; ipdb.set_trace()
-                        # observation, state = env.reset(num_icl_examples=args.num_icl_examples) 
-                        # if n_turn >0:
-                        #     for i in range(start_i,n_turn+start_i):
-                        #         action = cur_traj_state.history[i*2-1]['content']
-                        #         observation, state = env.step(action)
-        
-                        # assert state.history==cur_traj_state.history, f"state.history: {state.history}\ncur_traj_state.history: {cur_traj_state.history} mismatch"
-
-                        def extract_assistant_action_msgs(history):
-                            out = []
-                            for msg in history:
-                                if msg["role"] != "assistant":
-                                    continue
-                                text = msg["content"].strip()
-                                # берем именно те сообщения, которые реально шли в env.step (с Thought/Action или numeric disambiguation)
-                                if ("Action:" in text) or text.isdigit():
-                                    out.append(text)
-                            return out
-                        
-                        observation, state = env.reset(num_icl_examples=args.num_icl_examples)
+                        observation, state = env.reset(
+                            num_icl_examples=args.num_icl_examples
+                        )
                         _force_min_max_steps(env, turn_cap)
 
                         if n_turn > 0:
-                            prefix_actions = extract_assistant_action_msgs(cur_traj_state.history)[:n_turn]
+                            prefix_actions = _extract_assistant_action_msgs(
+                                cur_traj_state.history
+                            )[:n_turn]
                             for act_text in prefix_actions:
                                 observation, state = env.step(act_text)
 
-                        replay_actions = extract_assistant_action_msgs(state.history)
-                        traj_actions = extract_assistant_action_msgs(cur_traj_state.history)
-
+                        replay_actions = _extract_assistant_action_msgs(state.history)
+                        traj_actions = _extract_assistant_action_msgs(
+                            cur_traj_state.history
+                        )
                         assert replay_actions == traj_actions, (
                             f"[REPLAY ACTION MISMATCH] n_turn={n_turn}\n"
                             f"replay_actions={replay_actions}\n"
@@ -513,83 +690,401 @@ def main(args):
                             cur_state_history = cur_traj_state.history
                         else:
                             assert not args.disable_perturb
-                            if args.exp_config == 'webshop':
-                                cur_state_history = perturb_messages(instruction,copy.deepcopy(cur_traj_state.history))
+                            if args.exp_config == "webshop":
+                                cur_state_history = perturb_messages(
+                                    instruction,
+                                    copy.deepcopy(cur_traj_state.history),
+                                )
                             else:
-                                # Make sure the agent does not repeat the already explored action
+                                # Preserve the original candidate-diversifying
+                                # prompt used by QLASS for ALFWorld.
                                 if idx == 1:
-                                    explore_add_prompt = f"\nPlease provide another reasonable response different from '{action_list[0]}'."
+                                    explore_add_prompt = (
+                                        "\nPlease provide another reasonable "
+                                        f"response different from '{action_list[0]}'."
+                                    )
                                 else:
-                                    explore_add_prompt =f"\nYou have given the the following answers. \n"
-                                    for i in range(len(action_list)):
-                                        explore_add_prompt += f"Answer {i+1}: '{action_list[i]}'\n"
-                                    explore_add_prompt += "Please provide a reasonable response different from previous answers."
-                                cur_state_history = copy.deepcopy(cur_traj_state.history)
-                                cur_state_history[-1]['content'] += explore_add_prompt
-                            
-                        action = agent(cur_state_history)
-                        action_list.append(action)
-                        observation, new_state = env.step(action)
+                                    explore_add_prompt = (
+                                        "\nYou have given the the following answers. \n"
+                                    )
+                                    for action_idx, previous_action in enumerate(
+                                        action_list
+                                    ):
+                                        explore_add_prompt += (
+                                            f"Answer {action_idx + 1}: "
+                                            f"'{previous_action}'\n"
+                                        )
+                                    explore_add_prompt += (
+                                        "Please provide a reasonable response "
+                                        "different from previous answers."
+                                    )
+                                cur_state_history = copy.deepcopy(
+                                    cur_traj_state.history
+                                )
+                                cur_state_history[-1]["content"] += explore_add_prompt
+
+                        raw_action = agent(cur_state_history)
+                        action_list.append(raw_action)
+                        action_command = _parse_action_for_memory(
+                            env,
+                            raw_action,
+                            task_id=task.task_id,
+                            attempt_id=traj_id,
+                            step_id=n_turn,
+                            candidate_id=idx,
+                        )
+
+                        observation_after_action, new_state = env.step(raw_action)
+
+                        # Keep QLASS scoring unchanged. A terminal action has
+                        # an observed environment value; any non-terminal
+                        # action is evaluated by QNet.
                         if new_state.finished:
-                            new_state_candidates.append((new_state,new_state.reward))
+                            base_score = float(new_state.reward)
+                            score_source = "environment_terminal_reward"
                         else:
-                            Q_value = evaluate_trajs_qnet_v2(qnet, tokenizer, new_state, batch_size=1, disable_tqdm=True, model_name=args.model_name, debug=args.debug)[0]
-                            new_state_candidates.append((new_state,Q_value))
-                            action_value_dict.append({"action": action, "value": Q_value})
-
+                            base_score = float(
+                                evaluate_trajs_qnet_v2(
+                                    qnet,
+                                    tokenizer,
+                                    new_state,
+                                    batch_size=1,
+                                    disable_tqdm=True,
+                                    model_name=args.model_name,
+                                    debug=args.debug,
+                                )[0]
+                            )
+                            score_source = "qnet"
                             if i < 2 and n_turn < 3:
-                                print(f"[DBG] idx={idx} Q={Q_value:.4f} action={action.splitlines()[-1][:120]}")
+                                print(
+                                    f"[DBG] idx={idx} Q={base_score:.4f} "
+                                    f"action={raw_action.splitlines()[-1][:120]}"
+                                )
 
-                    # Select the best action from candidates based on the Q-values 
-                    if args.sample_mode == 'epsilon_greedy':
-                        if random.random() < EPSILON :  # Noted that this is not leakage, just a stopping signal from the model itself
-                            # Explore: randomly select a trajectory
-                            selected_traj = random.choice(new_state_candidates)
-                        else:
-                            # Exploit: select the best trajectory based on Q values
-                            selected_traj = max(new_state_candidates, key=lambda x: x[1])
-                    elif args.sample_mode == 'bon':
-                        selected_traj = max(new_state_candidates, key=lambda x: x[1])
-                    else:
-                        raise NotImplementedError(f"We do not support the sample mode: {args.sample_mode}")
-                    
-                    action_value_list.append(action_value_dict)
-                    # new_state, reward = selected_traj
-                    # new_node = TreeNode(state=new_state.to_dict()['conversations'][:-2], action=new_state.to_dict()['conversations'][-2], reward= reward)
-                    new_state, chosen_score = selected_traj  # chosen_score = Q_value (если не finished) или env reward (если finished)
-                    new_node = TreeNode(
-                        state=new_state.to_dict()['conversations'][:-2],
-                        action=new_state.to_dict()['conversations'][-2],
-                        reward=new_state.reward,   # всегда “настоящая” reward среды
+                        candidate_records.append(
+                            {
+                                "candidate_id": idx,
+                                "state": new_state,
+                                "raw_action": raw_action,
+                                "action_command": action_command,
+                                "observation_after_action": observation_after_action,
+                                "base_score": base_score,
+                                "corrected_score": base_score,
+                                "score_source": score_source,
+                                "finished": bool(new_state.finished),
+                                "success": bool(new_state.success),
+                                "memory_has_support": False,
+                                "memory_match_count": 0,
+                                "memory_mean_return": 0.0,
+                                "memory_raw_advantage": 0.0,
+                                "memory_normalized_advantage": 0.0,
+                                "memory_correction": 0.0,
+                            }
+                        )
+
+                    # Retrieval is performed once for the pre-action state.
+                    # The memory class returns neutral advantages for actions
+                    # without support and never introduces new actions.
+                    memory_result: Optional[Dict[str, Any]] = None
+                    if correction_memory is not None:
+                        memory_result = correction_memory.score_candidates(
+                            task_text=task_text,
+                            observation=observation_before_action,
+                            previous_actions=previous_action_commands,
+                            candidate_actions=[
+                                record["action_command"]
+                                for record in candidate_records
+                            ],
+                            inventory="",
+                        )
+                        memory_scores = memory_result["candidate_scores"]
+                        assert len(memory_scores) == len(candidate_records)
+
+                        for record, memory_score in zip(
+                            candidate_records, memory_scores
+                        ):
+                            normalized_advantage = float(
+                                memory_score["normalized_advantage"]
+                            )
+                            correction = args.memory_weight * normalized_advantage
+                            record.update(
+                                {
+                                    "memory_has_support": bool(
+                                        memory_score["has_memory_support"]
+                                    ),
+                                    "memory_match_count": int(
+                                        memory_score["match_count"]
+                                    ),
+                                    "memory_mean_return": float(
+                                        memory_score["mean_return"]
+                                    ),
+                                    "memory_raw_advantage": float(
+                                        memory_score["raw_advantage"]
+                                    ),
+                                    "memory_normalized_advantage": normalized_advantage,
+                                    "memory_correction": correction,
+                                    "corrected_score": record["base_score"] + correction,
+                                }
+                            )
+
+                    base_best_idx = max(
+                        range(len(candidate_records)),
+                        key=lambda candidate_idx: candidate_records[
+                            candidate_idx
+                        ]["base_score"],
                     )
-                    new_node.q_value = float(chosen_score)
-                    assert isinstance(new_state.to_dict()['conversations'][-2], dict) and new_state.to_dict()['conversations'][-2]['from']=='gpt'
+                    corrected_best_idx = max(
+                        range(len(candidate_records)),
+                        key=lambda candidate_idx: candidate_records[
+                            candidate_idx
+                        ]["corrected_score"],
+                    )
+                    ranking_changed_by_memory = base_best_idx != corrected_best_idx
+
+                    # An observed successful completion is ground-truth
+                    # information and takes precedence over memory correction.
+                    successful_candidate_indices = [
+                        candidate_idx
+                        for candidate_idx, record in enumerate(candidate_records)
+                        if record["finished"] and record["success"]
+                    ]
+                    selected_by_epsilon = False
+                    terminal_success_override_applied = bool(
+                        args.prefer_terminal_success
+                        and successful_candidate_indices
+                    )
+                    if terminal_success_override_applied:
+                        selected_idx = max(
+                            successful_candidate_indices,
+                            key=lambda candidate_idx: candidate_records[
+                                candidate_idx
+                            ]["base_score"],
+                        )
+                        selected_reason = "terminal_success_override"
+                    elif args.sample_mode == "epsilon_greedy":
+                        if random.random() < EPSILON:
+                            selected_idx = random.randrange(len(candidate_records))
+                            selected_by_epsilon = True
+                            selected_reason = "epsilon_exploration"
+                        else:
+                            selected_idx = corrected_best_idx
+                            selected_reason = (
+                                "corrected_argmax"
+                                if correction_memory is not None
+                                else "qnet_argmax"
+                            )
+                    elif args.sample_mode == "bon":
+                        selected_idx = corrected_best_idx
+                        selected_reason = (
+                            "corrected_argmax"
+                            if correction_memory is not None
+                            else "qnet_argmax"
+                        )
+                    else:
+                        raise NotImplementedError(
+                            f"We do not support the sample mode: {args.sample_mode}"
+                        )
+
+                    selection_changed_by_memory = bool(
+                        correction_memory is not None
+                        and not terminal_success_override_applied
+                        and not selected_by_epsilon
+                        and base_best_idx != selected_idx
+                    )
+                    has_nonzero_correction = any(
+                        abs(record["memory_correction"]) > 1e-12
+                        for record in candidate_records
+                    )
+                    steps_with_nonzero_correction += int(has_nonzero_correction)
+                    decisions_changed_by_memory += int(selection_changed_by_memory)
+
+                    selected_record = candidate_records[selected_idx]
+                    for candidate_idx, record in enumerate(candidate_records):
+                        record["selected"] = candidate_idx == selected_idx
+
+                    # Preserve the old ``value`` field as the base QNet score,
+                    # and save correction diagnostics alongside it.
+                    action_value_dict = [
+                        {
+                            "action": record["raw_action"],
+                            "value": record["base_score"],
+                            "base_score": record["base_score"],
+                            "corrected_score": record["corrected_score"],
+                            "memory_correction": record["memory_correction"],
+                            "memory_normalized_advantage": record[
+                                "memory_normalized_advantage"
+                            ],
+                            "memory_match_count": record["memory_match_count"],
+                            "selected": record["selected"],
+                        }
+                        for record in candidate_records
+                        if record["score_source"] == "qnet"
+                    ]
+                    action_value_list.append(action_value_dict)
+
+                    if correction_memory is not None:
+                        _append_jsonl_record(
+                            memory_log_file,
+                            {
+                                "record_type": "decision",
+                                "task_index": i,
+                                "task_id": task.task_id,
+                                "attempt_id": traj_id,
+                                "step_id": n_turn,
+                                "task_text": task_text,
+                                "observation_before_action": observation_before_action,
+                                "previous_action_commands": previous_action_commands,
+                                "memory_size_before": memory_result["memory_size"],
+                                "num_retrieved_neighbors": len(
+                                    memory_result["neighbors"]
+                                ),
+                                "num_above_threshold": memory_result[
+                                    "num_above_threshold"
+                                ],
+                                "effective_similarity_threshold": memory_result[
+                                    "effective_similarity_threshold"
+                                ],
+                                "baseline_return": memory_result["baseline_return"],
+                                "best_matches": memory_result["best_matches"],
+                                "base_best_candidate_id": base_best_idx,
+                                "corrected_best_candidate_id": corrected_best_idx,
+                                "selected_candidate_id": selected_idx,
+                                "selected_reason": selected_reason,
+                                "terminal_success_candidate_present": bool(
+                                    successful_candidate_indices
+                                ),
+                                "terminal_success_override_applied": (
+                                    terminal_success_override_applied
+                                ),
+                                "ranking_changed_by_memory": ranking_changed_by_memory,
+                                "selection_changed_by_memory": selection_changed_by_memory,
+                                "candidates": [
+                                    {
+                                        key: value
+                                        for key, value in record.items()
+                                        if key not in {"state", "observation_after_action"}
+                                    }
+                                    for record in candidate_records
+                                ],
+                            },
+                        )
+                        if selection_changed_by_memory:
+                            logger.info(
+                                "[MEMORY_CHANGED_DECISION] task=%r attempt=%d "
+                                "step=%d base=%r corrected=%r",
+                                task.task_id,
+                                traj_id,
+                                n_turn,
+                                candidate_records[base_best_idx]["action_command"],
+                                selected_record["action_command"],
+                            )
+
+                    new_state = selected_record["state"]
+                    # ``q_value`` retains its former meaning: raw QNet score
+                    # (or actual terminal reward). Hybrid values are stored
+                    # in additional node attributes.
+                    new_node = TreeNode(
+                        state=new_state.to_dict()["conversations"][:-2],
+                        action=new_state.to_dict()["conversations"][-2],
+                        reward=new_state.reward,
+                    )
+                    new_node.q_value = float(selected_record["base_score"])
+                    new_node.corrected_score = float(
+                        selected_record["corrected_score"]
+                    )
+                    new_node.memory_correction = float(
+                        selected_record["memory_correction"]
+                    )
+                    new_node.memory_normalized_advantage = float(
+                        selected_record["memory_normalized_advantage"]
+                    )
+                    assert (
+                        isinstance(new_state.to_dict()["conversations"][-2], dict)
+                        and new_state.to_dict()["conversations"][-2]["from"] == "gpt"
+                    )
                     current_node.add_child(new_node)
                     current_node = new_node
+
+                    # This is the only point where an action becomes executed
+                    # experience eligible for memory storage.
+                    executed_steps.append(
+                        {
+                            "task_text": task_text,
+                            "observation_before_action": observation_before_action,
+                            "inventory_before_action": "",
+                            "action_command": selected_record["action_command"],
+                            "raw_action": selected_record["raw_action"],
+                            "env_reward": float(new_state.reward),
+                            "base_q_score": selected_record["base_score"],
+                            "memory_normalized_advantage": selected_record[
+                                "memory_normalized_advantage"
+                            ],
+                            "corrected_score": selected_record["corrected_score"],
+                        }
+                    )
+
                     cur_traj_state = new_state
                     if cur_traj_state.finished:
                         print(
-                            f"[DBG_DONE] finished at n_turn={n_turn+1} "
-                            f"env.max_steps={getattr(env,'max_steps',None)} "
-                            f"state.steps={getattr(cur_traj_state,'steps',None)} "
-                            f"terminate_reason={getattr(cur_traj_state,'terminate_reason',None)}"
+                            f"[DBG_DONE] finished at n_turn={n_turn + 1} "
+                            f"env.max_steps={getattr(env, 'max_steps', None)} "
+                            f"state.steps={getattr(cur_traj_state, 'steps', None)} "
+                            f"terminate_reason={getattr(cur_traj_state, 'terminate_reason', None)}"
                         )
                         break
-                all_trajs.append(
-                    {
-                        'dataset': ds,
-                        'id': task.task_id,
-                        'conversations': cur_traj_state.to_dict()['conversations'],
-                        'reward': cur_traj_state.reward,
-                        'success': cur_traj_state.success,
-                        'action_value_dict': action_value_list
+
+                memory_update: Optional[Dict[str, Any]] = None
+                if correction_memory is not None:
+                    memory_update = correction_memory.add_episode(
+                        executed_steps=executed_steps,
+                        success=bool(cur_traj_state.success),
+                        final_reward=float(cur_traj_state.reward),
+                        task_id=task.task_id,
+                        attempt_id=traj_id,
+                        episode_metadata={
+                            "task_index": i,
+                            "steps_with_nonzero_correction": steps_with_nonzero_correction,
+                            "decisions_changed_by_memory": decisions_changed_by_memory,
+                        },
+                    )
+                    _append_jsonl_record(
+                        memory_log_file,
+                        {
+                            "record_type": "episode",
+                            "task_index": i,
+                            "task_id": task.task_id,
+                            "attempt_id": traj_id,
+                            "trajectory_length": len(executed_steps),
+                            "success": bool(cur_traj_state.success),
+                            "final_reward": float(cur_traj_state.reward),
+                            "steps_with_nonzero_correction": steps_with_nonzero_correction,
+                            "decisions_changed_by_memory": decisions_changed_by_memory,
+                            "memory_update": memory_update,
+                            "memory_stats_after": correction_memory.stats(),
+                        },
+                    )
+
+                trajectory_record = {
+                    "dataset": ds,
+                    "id": task.task_id,
+                    "conversations": cur_traj_state.to_dict()["conversations"],
+                    "reward": cur_traj_state.reward,
+                    "success": cur_traj_state.success,
+                    "action_value_dict": action_value_list,
+                }
+                if correction_memory is not None:
+                    trajectory_record["memory_correction_summary"] = {
+                        "steps_with_nonzero_correction": steps_with_nonzero_correction,
+                        "decisions_changed_by_memory": decisions_changed_by_memory,
+                        "memory_update": memory_update,
                     }
-                )
+                all_trajs.append(trajectory_record)
+
                 if cur_traj_state.success:
                     num_success += 1
                     if traj_id == 0:
                         num_first_success += 1
-                
+
 
             if num_success > 1:
                 mult_success_num += 1
@@ -767,6 +1262,118 @@ if __name__ == "__main__":
                         help="Keep first N messages when trimming for QNet scoring.")
     parser.add_argument("--qnet_min_tail_msgs", type=int, default=4,
                         help="Keep at least this many last messages when trimming for QNet scoring.")
+
+    # --- Added: JitRL-style ALFWorld memory correction of existing QLASS candidates ---
+    parser.add_argument(
+        "--enable_memory_correction",
+        action="store_true",
+        help=(
+            "Enable episodic-memory correction of QNet scores. "
+            "Currently supported only for --exp_config alfworld."
+        ),
+    )
+    parser.add_argument(
+        "--memory_dir",
+        type=str,
+        default=None,
+        help=(
+            "Persistent correction-memory directory. Use a fresh directory "
+            "for every experimental configuration."
+        ),
+    )
+    parser.add_argument(
+        "--memory_log_file",
+        type=str,
+        default=None,
+        help="JSONL file for step-level memory correction diagnostics.",
+    )
+    parser.add_argument(
+        "--reset_memory",
+        action="store_true",
+        help="Delete records already present in --memory_dir before this run.",
+    )
+    parser.add_argument(
+        "--memory_weight",
+        type=float,
+        default=0.0,
+        help="Lambda in corrected_score = qnet_score + lambda * normalized_advantage.",
+    )
+    parser.add_argument(
+        "--memory_gamma",
+        type=float,
+        default=0.97,
+        help="Discount factor used for terminal-only memory returns.",
+    )
+    parser.add_argument(
+        "--memory_top_k",
+        type=int,
+        default=10,
+        help="Maximum number of retrieved memory transitions per state.",
+    )
+    parser.add_argument(
+        "--memory_threshold",
+        type=float,
+        default=0.75,
+        help="Initial weighted-Jaccard threshold for episodic retrieval.",
+    )
+    parser.add_argument(
+        "--memory_terminal_step_penalty",
+        type=float,
+        default=0.0,
+        help=(
+            "Optional linear penalty for earlier steps of a terminal-only "
+            "trajectory."
+        ),
+    )
+    parser.add_argument(
+        "--memory_reward_mode",
+        type=str,
+        choices=["terminal_only"],
+        default="terminal_only",
+        help="Only terminal_only is implemented in the initial correction variant.",
+    )
+    fallback_group = parser.add_mutually_exclusive_group()
+    fallback_group.add_argument(
+        "--memory_use_env_reward_fallback",
+        dest="memory_use_env_reward_fallback",
+        action="store_true",
+        help=(
+            "Reserved for later experiments; not supported in the initial "
+            "terminal-only correction implementation."
+        ),
+    )
+    fallback_group.add_argument(
+        "--no-memory_use_env_reward_fallback",
+        dest="memory_use_env_reward_fallback",
+        action="store_false",
+        help="Explicitly disable environment reward fallback.",
+    )
+    parser.set_defaults(memory_use_env_reward_fallback=False)
+    parser.add_argument(
+        "--memory_scope",
+        type=str,
+        choices=["global", "per_task"],
+        default="global",
+        help=(
+            "global: memory persists across tasks and attempts; "
+            "per_task: memory is cleared for every new task."
+        ),
+    )
+    parser.add_argument(
+        "--memory_disable_dynamic_threshold",
+        action="store_true",
+        help="Use a fixed similarity threshold rather than JitRL-style decay.",
+    )
+    parser.add_argument(
+        "--prefer_terminal_success",
+        action="store_true",
+        help=(
+            "Optional safety ablation: if a candidate demonstrably succeeds "
+            "in the environment, select it regardless of corrected score. "
+            "Disabled by default to preserve the original QLASS selection "
+            "behavior when memory_weight=0."
+        ),
+    )
 
     args = parser.parse_args()
     if args.verbose:
