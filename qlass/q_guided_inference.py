@@ -324,20 +324,471 @@ EPSILON = 0.1
 TOPK = 2
 
 
-def _force_min_max_steps(env, min_steps: int):
+def _force_min_max_steps(env, min_steps: int) -> int:
     """SciWorld reset can overwrite env.max_steps (e.g. from max_steps.json). Force it back."""
     cur = getattr(env, "max_steps", None)
     if cur is None:
         env.max_steps = int(min_steps)
     else:
         env.max_steps = int(max(int(cur), int(min_steps)))
+    return int(env.max_steps)
+
+
+def is_q_adv_logit_strategy(args) -> bool:
+    return args.selection_strategy in {"q_adv_logit_argmax", "q_adv_logit_sample"}
+
+
+def get_candidate_raw_selection_score(candidate: Dict[str, Any]) -> float:
+    """Score used by the current QLASS selection logic.
+
+    For unfinished candidates this is QNet score.
+    For finished candidates this is environment reward.
+    """
+    return float(candidate["selection_score_raw"])
+
+
+def get_candidate_actor_logprob(candidate: Dict[str, Any], args) -> float:
+    """Return action-level actor logprob used in corrected-score selection.
+
+    Fail loudly if logprobs are missing in q_adv_logit mode, because without
+    them the method is no longer actor-logit correction.
+    """
+    if args.actor_logprob_type == "mean":
+        value = candidate.get("actor_logprob_mean")
+    elif args.actor_logprob_type == "sum":
+        value = candidate.get("actor_logprob_sum")
+    else:
+        raise ValueError(f"Unsupported actor_logprob_type: {args.actor_logprob_type}")
+
+    if value is None:
+        raise RuntimeError(
+            "[q_guided_inference] Missing actor logprob for q_adv_logit selection. "
+            f"idx={candidate.get('idx')} action={candidate.get('action')!r} "
+            f"actor_logprob_type={args.actor_logprob_type}"
+        )
+
+    return float(value)
+
+
+def compute_q_advantage_and_corrected_scores(
+    candidate_records: List[Dict[str, Any]],
+    args,
+) -> None:
+    """Fill q_mean/q_std/q_advantage/corrected_score in-place.
+
+    Q-like signal:
+      - for unfinished candidates: QNet score;
+      - for finished candidates: env reward;
+    both are already stored in selection_score_raw.
+
+    Corrected score:
+        corrected_score = actor_logprob_coef * actor_logprob
+                        + q_adv_beta * q_advantage
+    """
+    if not candidate_records:
+        raise RuntimeError("[q_guided_inference] Cannot compute scores for empty candidates.")
+
+    q_values = np.array(
+        [float(candidate["selection_score_raw"]) for candidate in candidate_records],
+        dtype=np.float64,
+    )
+
+    q_mean = float(np.mean(q_values))
+    q_std = float(np.std(q_values))
+
+    if len(candidate_records) < 2 or q_std <= args.q_adv_eps:
+        logger.warning(
+            "[Q_ADV] Degenerate Q-score distribution: num_candidates=%d q_mean=%.6f "
+            "q_std=%.6f eps=%.6f. Setting q_advantage=0 for all candidates.",
+            len(candidate_records),
+            q_mean,
+            q_std,
+            args.q_adv_eps,
+        )
+        q_advantages = np.zeros_like(q_values, dtype=np.float64)
+    else:
+        q_advantages = (q_values - q_mean) / (q_std + args.q_adv_eps)
+        q_advantages = np.clip(q_advantages, -args.q_adv_clip, args.q_adv_clip)
+
+    for candidate, q_advantage in zip(candidate_records, q_advantages.tolist()):
+        actor_logprob = get_candidate_actor_logprob(candidate, args)
+
+        corrected_score = (
+            args.actor_logprob_coef * actor_logprob
+            + args.q_adv_beta * float(q_advantage)
+        )
+
+        candidate["q_mean"] = q_mean
+        candidate["q_std"] = q_std
+        candidate["q_advantage"] = float(q_advantage)
+        candidate["actor_logprob_used"] = float(actor_logprob)
+        candidate["corrected_score"] = float(corrected_score)
+
+    # logger.info(
+    #     "[Q_ADV] Computed corrected scores: num_candidates=%d q_mean=%.6f q_std=%.6f "
+    #     "actor_logprob_type=%s actor_coef=%.6f q_adv_beta=%.6f q_adv_clip=%.6f",
+    #     len(candidate_records),
+    #     q_mean,
+    #     q_std,
+    #     args.actor_logprob_type,
+    #     args.actor_logprob_coef,
+    #     args.q_adv_beta,
+    #     args.q_adv_clip,
+    # )
+
+
+def get_candidate_corrected_score(candidate: Dict[str, Any]) -> float:
+    value = candidate.get("corrected_score")
+    if value is None:
+        raise RuntimeError(
+            "[q_guided_inference] corrected_score is missing. "
+            f"idx={candidate.get('idx')} action={candidate.get('action')!r}"
+        )
+    return float(value)
+
+
+def select_candidate_q_adv_logit(
+    candidate_records: List[Dict[str, Any]],
+    args,
+) -> Dict[str, Any]:
+    """Select candidate using corrected scores.
+
+    q_adv_logit_argmax:
+        deterministic argmax over corrected_score.
+
+    q_adv_logit_sample:
+        sample from softmax(corrected_score / temperature).
+    """
+    if not candidate_records:
+        raise RuntimeError("[q_guided_inference] Cannot select from empty candidate_records.")
+
+    if args.selection_strategy == "q_adv_logit_argmax":
+        selected = max(candidate_records, key=get_candidate_corrected_score)
+        logger.info(
+            "[SELECT_CORRECTED] argmax selected idx=%s action=%r corrected=%.6f "
+            "raw=%.6f q_adv=%.6f actor_logprob=%s",
+            selected.get("idx"),
+            selected.get("action"),
+            get_candidate_corrected_score(selected),
+            get_candidate_raw_selection_score(selected),
+            float(selected.get("q_advantage", 0.0)),
+            selected.get("actor_logprob_used"),
+        )
+        return selected
+
+    if args.selection_strategy == "q_adv_logit_sample":
+        scores = np.array(
+            [get_candidate_corrected_score(candidate) for candidate in candidate_records],
+            dtype=np.float64,
+        )
+
+        temperature = float(args.q_adv_sample_temperature)
+        if temperature <= 0:
+            raise ValueError(
+                f"--q_adv_sample_temperature must be positive, got {temperature}"
+            )
+
+        scaled_scores = scores / temperature
+        scaled_scores = scaled_scores - np.max(scaled_scores)
+        probs = np.exp(scaled_scores)
+        probs_sum = float(np.sum(probs))
+
+        if not np.isfinite(probs_sum) or probs_sum <= 0:
+            raise RuntimeError(
+                "[q_guided_inference] Invalid softmax probabilities for q_adv_logit_sample: "
+                f"scores={scores.tolist()} temperature={temperature}"
+            )
+
+        probs = probs / probs_sum
+        selected_idx = int(np.random.choice(len(candidate_records), p=probs))
+        selected = candidate_records[selected_idx]
+
+        logger.info(
+            "[SELECT_CORRECTED] sample selected local_idx=%d idx=%s action=%r "
+            "corrected=%.6f prob=%.6f temperature=%.6f raw=%.6f q_adv=%.6f "
+            "actor_logprob=%s all_probs=%s all_scores=%s",
+            selected_idx,
+            selected.get("idx"),
+            selected.get("action"),
+            get_candidate_corrected_score(selected),
+            float(probs[selected_idx]),
+            temperature,
+            get_candidate_raw_selection_score(selected),
+            float(selected.get("q_advantage", 0.0)),
+            selected.get("actor_logprob_used"),
+            [round(float(p), 6) for p in probs.tolist()],
+            [round(float(s), 6) for s in scores.tolist()],
+        )
+        return selected
+
+    raise NotImplementedError(
+        f"select_candidate_q_adv_logit does not support selection_strategy={args.selection_strategy}"
+    )
+
+
+def compute_and_mark_selection_diagnostics(
+    candidate_records: List[Dict[str, Any]],
+    selected_candidate: Dict[str, Any],
+    args,
+) -> Dict[str, Any]:
+    """Compute per-step diagnostics comparing raw-Q and corrected-score choices.
+
+    Marks candidate records in-place with:
+      - selected_by_raw_q
+      - selected_by_corrected_argmax
+      - selected_by_final_policy
+
+    Definitions:
+      raw_best:
+        candidate selected by original QLASS raw score.
+
+      corrected_argmax:
+        candidate with max corrected_score.
+        Defined only for q_adv_logit strategies.
+
+      selected_candidate:
+        actually selected candidate.
+        For q_adv_logit_argmax: equals corrected_argmax.
+        For q_adv_logit_sample: sampled from corrected-score distribution.
+    """
+    if not candidate_records:
+        raise RuntimeError("[q_guided_inference] Empty candidate_records in diagnostics.")
+
+    raw_best = max(candidate_records, key=get_candidate_raw_selection_score)
+
+    if is_q_adv_logit_strategy(args):
+        corrected_argmax = max(candidate_records, key=get_candidate_corrected_score)
+    else:
+        corrected_argmax = None
+
+    raw_best_action = raw_best.get("action")
+    selected_action = selected_candidate.get("action")
+
+    raw_vs_selected_changed = actions_differ_for_change_stats(
+        raw_best_action,
+        selected_action,
+    )
+
+    raw_best_idx = raw_best.get("idx")
+    corrected_argmax_idx = corrected_argmax.get("idx") if corrected_argmax is not None else None
+    selected_idx = selected_candidate.get("idx")
+
+    for candidate in candidate_records:
+        candidate["selected_by_raw_q"] = candidate.get("idx") == raw_best_idx
+        candidate["selected_by_corrected_argmax"] = (
+            corrected_argmax is not None and candidate.get("idx") == corrected_argmax_idx
+        )
+        candidate["selected_by_final_policy"] = candidate.get("idx") == selected_idx
+
+    diagnostics = {
+        "is_q_adv_logit_strategy": bool(is_q_adv_logit_strategy(args)),
+        "selection_strategy": args.selection_strategy,
+
+        "raw_best_idx": raw_best_idx,
+        "raw_best_action": raw_best_action,
+        "raw_best_score": get_candidate_raw_selection_score(raw_best),
+
+        "selected_idx": selected_idx,
+        "selected_action": selected_action,
+        "selected_corrected_score": selected_candidate.get("corrected_score"),
+
+        "raw_vs_selected_changed": bool(raw_vs_selected_changed),
+    }
+
+    logger.info(
+        "[STEP_CORRECTION_DIAG] strategy=%s raw_best_idx=%s raw_best_action=%r "
+        "selected_idx=%s "
+        "selected_action=%r "
+        "raw_vs_selected_changed=%s",
+        diagnostics["selection_strategy"],
+        diagnostics["raw_best_idx"],
+        diagnostics["raw_best_action"],
+        diagnostics["selected_idx"],
+        diagnostics["selected_action"],
+        diagnostics["raw_vs_selected_changed"],
+    )
+
+    return diagnostics
+
+
+def sync_action_value_dict_with_candidate_records(
+    action_value_dict: List[Dict[str, Any]],
+    candidate_records: List[Dict[str, Any]],
+) -> None:
+    """Copy computed q-adv/corrected fields from candidate records to JSON logs."""
+    by_idx = {candidate["idx"]: candidate for candidate in candidate_records}
+
+    for item in action_value_dict:
+        candidate = by_idx.get(item["idx"])
+        if candidate is None:
+            raise RuntimeError(
+                "[q_guided_inference] action_value_dict contains idx not found in "
+                f"candidate_records: idx={item['idx']}"
+            )
+
+        item["q_mean"] = candidate.get("q_mean")
+        item["q_std"] = candidate.get("q_std")
+        item["q_advantage"] = candidate.get("q_advantage")
+        item["actor_logprob_used"] = candidate.get("actor_logprob_used")
+        item["corrected_score"] = candidate.get("corrected_score")
+        item["selected"] = bool(candidate.get("selected", False))
+        item["selected_by_raw_q"] = bool(candidate.get("selected_by_raw_q", False))
+        item["selected_by_final_policy"] = bool(
+            candidate.get("selected_by_final_policy", False)
+        )
+
+
+def select_candidate_raw_q_argmax(
+    candidate_records: List[Dict[str, Any]],
+    args,
+) -> Dict[str, Any]:
+    """Select candidate using the original QLASS logic.
+
+    This function intentionally ignores actor logprobs and future corrected scores.
+    It is used for the infrastructure step where candidate records and logprobs
+    are added, but the final selection rule is not changed yet.
+    """
+    if not candidate_records:
+        raise RuntimeError("[q_guided_inference] Cannot select from empty candidate_records.")
+
+    if args.sample_mode == "epsilon_greedy":
+        if random.random() < EPSILON:
+            selected = random.choice(candidate_records)
+            logger.info(
+                "[SELECT_RAW] epsilon_greedy explored: selected idx=%s action=%r raw_score=%.6f",
+                selected.get("idx"),
+                selected.get("action"),
+                get_candidate_raw_selection_score(selected),
+            )
+            return selected
+
+        selected = max(candidate_records, key=get_candidate_raw_selection_score)
+        logger.info(
+            "[SELECT_RAW] epsilon_greedy exploited: selected idx=%s action=%r raw_score=%.6f",
+            selected.get("idx"),
+            selected.get("action"),
+            get_candidate_raw_selection_score(selected),
+        )
+        return selected
+
+    if args.sample_mode == "bon":
+        selected = max(candidate_records, key=get_candidate_raw_selection_score)
+        logger.info(
+            "[SELECT_RAW] bon selected idx=%s action=%r raw_score=%.6f",
+            selected.get("idx"),
+            selected.get("action"),
+            get_candidate_raw_selection_score(selected),
+        )
+        return selected
+
+    raise NotImplementedError(f"We do not support the sample mode: {args.sample_mode}")
+
+
+def log_candidate_records(
+    candidate_records: List[Dict[str, Any]],
+    *,
+    task_id: Any,
+    traj_id: int,
+    n_turn: int,
+    selection_strategy: str,
+) -> None:
+    # logger.info(
+    #     "[CANDIDATES] task=%s traj=%d turn=%d strategy=%s num_candidates=%d",
+    #     task_id,
+    #     traj_id,
+    #     n_turn,
+    #     selection_strategy,
+    #     len(candidate_records),
+    # )
+
+    for cand in candidate_records:
+        logger.info(
+            "[CANDIDATE] task=%s traj=%d turn=%d idx=%s action=%r "
+            "finished=%s env_reward=%s raw_score=%.6f q_score=%s "
+            "q_mean=%s q_std=%s q_advantage=%s corrected_score=%s "
+            "actor_logprob_used=%s actor_logprob_mean=%s actor_logprob_sum=%s "
+            "num_tokens=%s selected=%s selected_by_raw_q=%s selected_by_final_policy=%s generation_mode=%s raw_index=%s round_index=%s",
+            task_id,
+            traj_id,
+            n_turn,
+            cand.get("idx"),
+            cand.get("action"),
+            cand.get("finished"),
+            cand.get("env_reward"),
+            float(cand.get("selection_score_raw", 0.0)),
+            cand.get("q_score"),
+            cand.get("q_mean"),
+            cand.get("q_std"),
+            cand.get("q_advantage"),
+            cand.get("corrected_score"),
+            cand.get("actor_logprob_used"),
+            cand.get("actor_logprob_mean"),
+            cand.get("actor_logprob_sum"),
+            cand.get("num_output_tokens"),
+            cand.get("selected"),
+            cand.get("selected_by_raw_q"),
+            cand.get("selected_by_final_policy"),
+            cand.get("generation_mode"),
+            cand.get("raw_index"),
+            cand.get("round_index"),
+        )
+
+
+def safe_float_or_none(value: Any) -> float | None:
+    """Convert numeric value to float, keep None as None.
+
+    Some environments/states can have reward=None for non-terminal intermediate
+    states. This should not break candidate logging, because raw selection score
+    for unfinished states is QNet score.
+    """
+    if value is None:
+        return None
+    return float(value)
+
+
+def reward_to_float(value: Any) -> float:
+    """Convert trajectory reward to metric-safe float.
+
+    In ALFWorld/SciWorld unfinished trajectories can have reward=None.
+    For evaluation, None should be treated as 0.0.
+    """
+    if value is None:
+        return 0.0
+    return float(value)
+
+
+def normalize_action_for_change_stats(action: Any) -> str:
+    """Normalize action string for correction-change statistics."""
+    if action is None:
+        return ""
+    return " ".join(str(action).strip().lower().split())
+
+
+def actions_differ_for_change_stats(action_a: Any, action_b: Any) -> bool:
+    """Return True if two actions should be treated as different."""
+    return normalize_action_for_change_stats(action_a) != normalize_action_for_change_stats(action_b)
+
+
+def safe_rate(numerator: int, denominator: int) -> float:
+    return float(numerator) / float(denominator) if denominator > 0 else 0.0
 
 
 def main(args):
+    if is_q_adv_logit_strategy(args) and args.disable_perturb is False:
+        logger.info(
+            "[q_guided_inference] q_adv_logit strategy uses canonical single-prompt candidate generation with logprobs. The old explore_add_prompt perturbation "
+            "will be ignored for candidate generation in this mode."
+        )
+
     total_examples = []
     total_trees = []
     successful_trajs = []
     token_count = 0
+
+    global_correction_stats = {
+        "num_q_adv_steps": 0,
+        "num_raw_vs_selected_changed": 0,
+    }
     
     args.model_name_or_path = args.qnet_path
     args.low_cpu_mem_usage = False
@@ -462,36 +913,144 @@ def main(args):
                 print(f"[DBG_MAX_STEPS] AFTER reset(traj{traj_id}) (forced): env.max_steps={getattr(env,'max_steps',None)}")
 
                 action_value_list = []
+
+                step_selection_diagnostics_list = []
+
+                traj_correction_stats = {
+                    "num_q_adv_steps": 0,
+                    "num_raw_vs_selected_changed": 0,
+                    "raw_vs_selected_changed_rate": 0.0,
+                }
                 # for n_turn in range(turn_cap):
                 for n_turn in range(env.max_steps):
-                    new_state_candidates = []
-                    if n_turn==0:
-                        current_node=root
-                    action_list = []
-                    action_value_dict = []
+                    candidate_records: List[Dict[str, Any]] = []
 
-                    # Sampling N actions and select the best one
-                    for idx in range(args.best_of_N):
-                        # import ipdb; ipdb.set_trace()
-                        # observation, state = env.reset(num_icl_examples=args.num_icl_examples) 
-                        # if n_turn >0:
-                        #     for i in range(start_i,n_turn+start_i):
-                        #         action = cur_traj_state.history[i*2-1]['content']
-                        #         observation, state = env.step(action)
-        
-                        # assert state.history==cur_traj_state.history, f"state.history: {state.history}\ncur_traj_state.history: {cur_traj_state.history} mismatch"
+                    if n_turn == 0:
+                        current_node = root
 
-                        def extract_assistant_action_msgs(history):
-                            out = []
-                            for msg in history:
-                                if msg["role"] != "assistant":
-                                    continue
-                                text = msg["content"].strip()
-                                # берем именно те сообщения, которые реально шли в env.step (с Thought/Action или numeric disambiguation)
-                                if ("Action:" in text) or text.isdigit():
-                                    out.append(text)
-                            return out
-                        
+                    action_value_dict: List[Dict[str, Any]] = []
+
+                    def extract_assistant_action_msgs(history):
+                        out = []
+                        for msg in history:
+                            if msg["role"] != "assistant":
+                                continue
+                            text = msg["content"].strip()
+                            # Keep exactly the assistant messages that were actually sent to env.step:
+                            # either normal Thought/Action outputs or numeric disambiguation replies.
+                            if ("Action:" in text) or text.isdigit():
+                                out.append(text)
+                        return out
+
+                    # ------------------------------------------------------------------
+                    # Candidate generation.
+                    # Old QLASS path:
+                    #   - args.best_of_N separate calls;
+                    #   - idx > 0 may use explore_add_prompt / perturbation.
+                    #
+                    # New q_adv_logit path:
+                    #   - one canonical prompt;
+                    #   - oversampling + dedup inside SGLangAgent;
+                    #   - each candidate has actor output-token logprobs.
+                    # ------------------------------------------------------------------
+                    if is_q_adv_logit_strategy(args):
+                        generated_candidates = agent.generate_candidates_with_logprobs(
+                            cur_traj_state.history,
+                            n=args.best_of_N,
+                            oversample_factor=args.candidate_oversample_factor,
+                            max_rounds=args.candidate_max_rounds,
+                        )
+
+                        logger.info(
+                            "[GEN_QADV] task=%s traj=%d turn=%d requested_best_of_N=%d "
+                            "received_unique_candidates=%d",
+                            task.task_id,
+                            traj_id,
+                            n_turn,
+                            args.best_of_N,
+                            len(generated_candidates),
+                        )
+
+                        candidate_generation_items = []
+                        for idx, cand in enumerate(generated_candidates):
+                            candidate_generation_items.append(
+                                {
+                                    "idx": idx,
+                                    "action_text_for_env": cand["text"],
+                                    "parsed_action": cand.get("action"),
+                                    "actor_logprob_sum": cand.get("actor_logprob_sum"),
+                                    "actor_logprob_mean": cand.get("actor_logprob_mean"),
+                                    "num_output_tokens": cand.get("num_output_tokens"),
+                                    "finish_reason": cand.get("finish_reason"),
+                                    "raw_index": cand.get("raw_index"),
+                                    "round_index": cand.get("round_index"),
+                                    "generation_mode": "q_adv_logit",
+                                }
+                            )
+                    else:
+                        candidate_generation_items = []
+
+                        action_list = []
+                        for idx in range(args.best_of_N):
+                            if (not idx) or args.disable_perturb:
+                                cur_state_history = cur_traj_state.history
+                            else:
+                                assert not args.disable_perturb
+                                if args.exp_config == "webshop":
+                                    cur_state_history = perturb_messages(
+                                        instruction,
+                                        copy.deepcopy(cur_traj_state.history),
+                                    )
+                                else:
+                                    # Old QLASS diversity prompt. This path is intentionally
+                                    # not used by q_adv_logit strategies because it changes the
+                                    # policy context and makes actor logprobs incomparable.
+                                    if idx == 1:
+                                        explore_add_prompt = (
+                                            f"\nPlease provide another reasonable response "
+                                            f"different from '{action_list[0]}'."
+                                        )
+                                    else:
+                                        explore_add_prompt = "\nYou have given the the following answers.\n"
+                                        for prev_i in range(len(action_list)):
+                                            explore_add_prompt += (
+                                                f"Answer {prev_i + 1}: '{action_list[prev_i]}'\n"
+                                            )
+                                        explore_add_prompt += (
+                                            "Please provide a reasonable response different "
+                                            "from previous answers."
+                                        )
+
+                                    cur_state_history = copy.deepcopy(cur_traj_state.history)
+                                    cur_state_history[-1]["content"] += explore_add_prompt
+
+                            action = agent(cur_state_history)
+                            action_list.append(action)
+
+                            candidate_generation_items.append(
+                                {
+                                    "idx": idx,
+                                    "action_text_for_env": action,
+                                    "parsed_action": None,
+                                    "actor_logprob_sum": None,
+                                    "actor_logprob_mean": None,
+                                    "num_output_tokens": None,
+                                    "finish_reason": None,
+                                    "raw_index": idx,
+                                    "round_index": 0,
+                                    "generation_mode": "old_q_guided",
+                                }
+                            )
+
+                    # ------------------------------------------------------------------
+                    # Candidate evaluation.
+                    # Evaluate all generated candidates with the same replay + env.step +
+                    # QNet logic as the original QLASS implementation.
+                    # ------------------------------------------------------------------
+                    for cand_item in candidate_generation_items:
+                        idx = int(cand_item["idx"])
+                        action = cand_item["action_text_for_env"]
+
                         observation, state = env.reset(num_icl_examples=args.num_icl_examples)
                         _force_min_max_steps(env, turn_cap)
 
@@ -500,67 +1059,193 @@ def main(args):
                             for act_text in prefix_actions:
                                 observation, state = env.step(act_text)
 
-                        replay_actions = extract_assistant_action_msgs(state.history)
-                        traj_actions = extract_assistant_action_msgs(cur_traj_state.history)
+                            replay_actions = extract_assistant_action_msgs(state.history)
+                            traj_actions = extract_assistant_action_msgs(cur_traj_state.history)
+                            assert replay_actions == traj_actions, (
+                                f"[REPLAY ACTION MISMATCH] n_turn={n_turn}\n"
+                                f"replay_actions={replay_actions}\n"
+                                f"traj_actions={traj_actions}\n"
+                            )
 
-                        assert replay_actions == traj_actions, (
-                            f"[REPLAY ACTION MISMATCH] n_turn={n_turn}\n"
-                            f"replay_actions={replay_actions}\n"
-                            f"traj_actions={traj_actions}\n"
+                        observation, new_state = env.step(action)
+
+                        env_reward = safe_float_or_none(new_state.reward)
+
+                        if new_state.finished:
+                            if env_reward is None:
+                                raise RuntimeError(
+                                    "[q_guided_inference] Finished candidate has reward=None. "
+                                    f"task={task.task_id} traj={traj_id} turn={n_turn} "
+                                    f"idx={idx} action={action!r}"
+                                )
+
+                            q_score = None
+                            selection_score_raw = float(env_reward)
+                        else:
+                            q_score = float(
+                                evaluate_trajs_qnet_v2(
+                                    qnet,
+                                    tokenizer,
+                                    new_state,
+                                    batch_size=1,
+                                    disable_tqdm=True,
+                                    model_name=args.model_name,
+                                    debug=args.debug,
+                                )[0]
+                            )
+                            selection_score_raw = q_score
+
+                        parsed_action = cand_item.get("parsed_action")
+                        if parsed_action is None:
+                            parsed_action = action
+
+                        candidate_record = {
+                            "idx": idx,
+                            "action": parsed_action,
+                            "action_text_for_env": action,
+                            "new_state": new_state,
+                            "finished": bool(new_state.finished),
+                            "env_reward": env_reward,
+                            "q_score": q_score,
+                            "selection_score_raw": float(selection_score_raw),
+                            # The same scalar is used as the Q-like signal for z-score advantage.
+                            "q_for_advantage": float(selection_score_raw),
+                            "actor_logprob_sum": cand_item.get("actor_logprob_sum"),
+                            "actor_logprob_mean": cand_item.get("actor_logprob_mean"),
+                            "actor_logprob_used": None,
+                            "num_output_tokens": cand_item.get("num_output_tokens"),
+                            "finish_reason": cand_item.get("finish_reason"),
+                            "raw_index": cand_item.get("raw_index"),
+                            "round_index": cand_item.get("round_index"),
+                            "generation_mode": cand_item.get("generation_mode"),
+                            # Filled in the next implementation step.
+                            "q_mean": None,
+                            "q_std": None,
+                            "q_advantage": None,
+                            "corrected_score": None,
+                            "selected": False,
+                            "selected_by_raw_q": False,
+                            "selected_by_final_policy": False,
+                        }
+
+                        candidate_records.append(candidate_record)
+
+                        action_value_dict.append(
+                            {
+                                "idx": idx,
+                                "action": candidate_record["action_text_for_env"],
+                                "parsed_action": candidate_record["action"],
+                                "value": candidate_record["selection_score_raw"],
+                                "q_score": candidate_record["q_score"],
+                                "selection_score_raw": candidate_record["selection_score_raw"],
+                                "q_for_advantage": candidate_record["q_for_advantage"],
+                                "actor_logprob_sum": candidate_record["actor_logprob_sum"],
+                                "actor_logprob_mean": candidate_record["actor_logprob_mean"],
+                                "actor_logprob_used": candidate_record["actor_logprob_used"],
+                                "num_output_tokens": candidate_record["num_output_tokens"],
+                                "finished": candidate_record["finished"],
+                                "env_reward": candidate_record["env_reward"],
+                                "generation_mode": candidate_record["generation_mode"],
+                                "raw_index": candidate_record["raw_index"],
+                                "round_index": candidate_record["round_index"],
+                                "q_mean": None,
+                                "q_std": None,
+                                "q_advantage": None,
+                                "corrected_score": None,
+                                "selected": False,
+                                "selected_by_raw_q": False,
+                                "selected_by_final_policy": False,
+                            }
                         )
 
-                        if (not idx) or args.disable_perturb:
-                            cur_state_history = cur_traj_state.history
-                        else:
-                            assert not args.disable_perturb
-                            if args.exp_config == 'webshop':
-                                cur_state_history = perturb_messages(instruction,copy.deepcopy(cur_traj_state.history))
-                            else:
-                                # Make sure the agent does not repeat the already explored action
-                                if idx == 1:
-                                    explore_add_prompt = f"\nPlease provide another reasonable response different from '{action_list[0]}'."
-                                else:
-                                    explore_add_prompt =f"\nYou have given the the following answers. \n"
-                                    for i in range(len(action_list)):
-                                        explore_add_prompt += f"Answer {i+1}: '{action_list[i]}'\n"
-                                    explore_add_prompt += "Please provide a reasonable response different from previous answers."
-                                cur_state_history = copy.deepcopy(cur_traj_state.history)
-                                cur_state_history[-1]['content'] += explore_add_prompt
-                            
-                        action = agent(cur_state_history)
-                        action_list.append(action)
-                        observation, new_state = env.step(action)
-                        if new_state.finished:
-                            new_state_candidates.append((new_state,new_state.reward))
-                        else:
-                            Q_value = evaluate_trajs_qnet_v2(qnet, tokenizer, new_state, batch_size=1, disable_tqdm=True, model_name=args.model_name, debug=args.debug)[0]
-                            new_state_candidates.append((new_state,Q_value))
-                            action_value_dict.append({"action": action, "value": Q_value})
+                        # if i < 2 and n_turn < 3:
+                        #     score_for_print = candidate_record["selection_score_raw"]
+                        #     print(
+                        #         f"[DBG] idx={idx} raw_score={score_for_print:.4f} "
+                        #         f"q={candidate_record['q_score']} "
+                        #         f"logp_mean={candidate_record['actor_logprob_mean']} "
+                        #         f"action={str(action).splitlines()[-1][:120]}"
+                        #     )
 
-                            if i < 2 and n_turn < 3:
-                                print(f"[DBG] idx={idx} Q={Q_value:.4f} action={action.splitlines()[-1][:120]}")
+                    if not candidate_records:
+                        raise RuntimeError(
+                            f"[q_guided_inference] No candidates generated/evaluated for "
+                            f"task={task.task_id}, traj={traj_id}, turn={n_turn}."
+                        )
 
-                    # Select the best action from candidates based on the Q-values 
-                    if args.sample_mode == 'epsilon_greedy':
-                        if random.random() < EPSILON :  # Noted that this is not leakage, just a stopping signal from the model itself
-                            # Explore: randomly select a trajectory
-                            selected_traj = random.choice(new_state_candidates)
-                        else:
-                            # Exploit: select the best trajectory based on Q values
-                            selected_traj = max(new_state_candidates, key=lambda x: x[1])
-                    elif args.sample_mode == 'bon':
-                        selected_traj = max(new_state_candidates, key=lambda x: x[1])
+                    # ------------------------------------------------------------------
+                    # Compute corrected scores and select candidate.
+                    # ------------------------------------------------------------------
+                    if is_q_adv_logit_strategy(args):
+                        compute_q_advantage_and_corrected_scores(candidate_records, args)
+                        selected_candidate = select_candidate_q_adv_logit(candidate_records, args)
                     else:
-                        raise NotImplementedError(f"We do not support the sample mode: {args.sample_mode}")
-                    
+                        selected_candidate = select_candidate_raw_q_argmax(candidate_records, args)
+
+                    selected_candidate["selected"] = True
+
+                    selection_diagnostics = compute_and_mark_selection_diagnostics(
+                        candidate_records=candidate_records,
+                        selected_candidate=selected_candidate,
+                        args=args,
+                    )
+                    selection_diagnostics["turn"] = n_turn
+                    selection_diagnostics["task_id"] = task.task_id
+                    selection_diagnostics["traj_id"] = traj_id
+                    step_selection_diagnostics_list.append(selection_diagnostics)
+
+                    if selection_diagnostics["is_q_adv_logit_strategy"]:
+                        traj_correction_stats["num_q_adv_steps"] += 1
+                        global_correction_stats["num_q_adv_steps"] += 1
+
+                        if selection_diagnostics["raw_vs_selected_changed"]:
+                            traj_correction_stats["num_raw_vs_selected_changed"] += 1
+                            global_correction_stats["num_raw_vs_selected_changed"] += 1
+
+                    # Sync computed fields and selected flag into JSON-serializable logs.
+                    sync_action_value_dict_with_candidate_records(
+                        action_value_dict,
+                        candidate_records,
+                    )
+
+                    log_candidate_records(
+                        candidate_records,
+                        task_id=task.task_id,
+                        traj_id=traj_id,
+                        n_turn=n_turn,
+                        selection_strategy=args.selection_strategy,
+                    )
+
                     action_value_list.append(action_value_dict)
-                    # new_state, reward = selected_traj
-                    # new_node = TreeNode(state=new_state.to_dict()['conversations'][:-2], action=new_state.to_dict()['conversations'][-2], reward= reward)
-                    new_state, chosen_score = selected_traj  # chosen_score = Q_value (если не finished) или env reward (если finished)
+
+                    new_state = selected_candidate["new_state"]
+
+                    # Keep TreeNode.q_value compatible with original QLASS:
+                    # store raw QNet/env score, not corrected_score.
+                    chosen_score = selected_candidate["selection_score_raw"]
+
+                    logger.info(
+                        "[SELECT_FINAL] task=%s traj=%d turn=%d strategy=%s "
+                        "selected_idx=%s action=%r raw_score=%.6f corrected_score=%s "
+                        "q_advantage=%s actor_logprob_used=%s",
+                        task.task_id,
+                        traj_id,
+                        n_turn,
+                        args.selection_strategy,
+                        selected_candidate.get("idx"),
+                        selected_candidate.get("action"),
+                        float(selected_candidate.get("selection_score_raw")),
+                        selected_candidate.get("corrected_score"),
+                        selected_candidate.get("q_advantage"),
+                        selected_candidate.get("actor_logprob_used"),
+                    )
+
+                    # chosen_score is still the original raw QLASS selection score:
+                    # QNet score for unfinished candidates or env reward for finished candidates.
                     new_node = TreeNode(
                         state=new_state.to_dict()['conversations'][:-2],
                         action=new_state.to_dict()['conversations'][-2],
-                        reward=new_state.reward,   # всегда “настоящая” reward среды
+                        reward=new_state.reward,
                     )
                     new_node.q_value = float(chosen_score)
                     assert isinstance(new_state.to_dict()['conversations'][-2], dict) and new_state.to_dict()['conversations'][-2]['from']=='gpt'
@@ -575,14 +1260,30 @@ def main(args):
                             f"terminate_reason={getattr(cur_traj_state,'terminate_reason',None)}"
                         )
                         break
+                traj_correction_stats["raw_vs_selected_changed_rate"] = safe_rate(
+                    traj_correction_stats["num_raw_vs_selected_changed"],
+                    traj_correction_stats["num_q_adv_steps"],
+                )
+                logger.info(
+                    "[TRAJ_CORRECTION_STATS] task=%s traj=%d strategy=%s "
+                    "q_adv_steps=%d raw_vs_selected_changed=%d rate=%.4f ",
+                    task.task_id,
+                    traj_id,
+                    args.selection_strategy,
+                    traj_correction_stats["num_q_adv_steps"],
+                    traj_correction_stats["num_raw_vs_selected_changed"],
+                    traj_correction_stats["raw_vs_selected_changed_rate"],
+                )
                 all_trajs.append(
                     {
                         'dataset': ds,
                         'id': task.task_id,
                         'conversations': cur_traj_state.to_dict()['conversations'],
-                        'reward': cur_traj_state.reward,
-                        'success': cur_traj_state.success,
-                        'action_value_dict': action_value_list
+                        'reward': reward_to_float(cur_traj_state.reward),
+                        'success': bool(cur_traj_state.success),
+                        'action_value_dict': action_value_list,
+                        'selection_diagnostics': step_selection_diagnostics_list,
+                        'q_adv_correction_stats': traj_correction_stats,
                     }
                 )
                 if cur_traj_state.success:
@@ -620,12 +1321,30 @@ def main(args):
         pbar.close()
 
     n_traj = len(total_examples)
-    n_success = sum([ 1. if traj['reward']==1.0 else 0. for traj in total_examples])
-    rewards = [traj['reward'] for traj in total_examples]
+    rewards = [reward_to_float(traj.get("reward")) for traj in total_examples]
+    n_success = sum(1.0 for reward in rewards if reward == 1.0)
+
+    global_correction_stats["raw_vs_selected_changed_rate"] = safe_rate(
+        global_correction_stats["num_raw_vs_selected_changed"],
+        global_correction_stats["num_q_adv_steps"],
+    )
+
+    global_stats_msg = (
+        "[GLOBAL_CORRECTION_STATS] "
+        f"strategy={args.selection_strategy} "
+        f"q_adv_steps={global_correction_stats['num_q_adv_steps']} "
+        f"raw_vs_selected_changed={global_correction_stats['num_raw_vs_selected_changed']} "
+        f"rate={global_correction_stats['raw_vs_selected_changed_rate']:.4f}"
+    )
+
+    logger.info(global_stats_msg)
+    print(global_stats_msg)
+
     print(f"Finally, The Number of Successful Trajectories: {n_success} / {n_traj} ")
     print(f"Finally, The Number of Successful Trajectories with multi evaluation: {mult_success_num} / {n_tasks} ")
     print(f"Finally, The Number of Successful Trajectories with first inference: {num_first_success} / {n_tasks} ")
-    print(f"Average Reward: {sum(rewards) / n_traj}")
+    print(f"Average Reward: {sum(rewards) / n_traj if n_traj > 0 else 0.0}")
+
     if args.debug:
         traj_file = f'{root_dir}/data/train/explore/debug2.jsonl'
         tree_file = f'{root_dir}/data/train/explore/debug2.pkl'
@@ -635,7 +1354,13 @@ def main(args):
             
     with open(tree_file, 'wb') as f:
         pickle.dump(total_trees, f)
-        
+    global_stats_file = os.path.join(args.output_dir, f"{args.slice_id}of{args.slice_num}_q_adv_global_correction_stats.json")
+    with open(global_stats_file, "w") as f:
+        json.dump(global_correction_stats, f, indent=2)
+
+    logger.info("[GLOBAL_CORRECTION_STATS] Saved to %s", global_stats_file)
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--data_dir", type=str)
@@ -746,6 +1471,72 @@ if __name__ == "__main__":
         default='epsilon_greedy',
         help="Sampling mode for the trajectories.",
     )
+
+    parser.add_argument(
+        "--selection_strategy",
+        type=str,
+        default="q_argmax",
+        choices=["q_argmax", "q_adv_logit_argmax", "q_adv_logit_sample"],
+        help=(
+            "Final candidate selection strategy. "
+            "q_argmax keeps the original QLASS raw-Q selection. "
+            "q_adv_logit_argmax/q_adv_logit_sample enable canonical candidate generation with actor output logprobs; corrected-score selection is added in the next step."
+        ),
+    )
+    parser.add_argument(
+        "--q_adv_beta",
+        type=float,
+        default=1.0,
+        help="Weight for Q-derived normalized advantage in corrected-score selection.",
+    )
+    parser.add_argument(
+        "--actor_logprob_coef",
+        type=float,
+        default=1.0,
+        help="Weight for actor action-level logprob in corrected-score selection.",
+    )
+    parser.add_argument(
+        "--q_adv_eps",
+        type=float,
+        default=1e-6,
+        help="Epsilon for Q-score std normalization in q-advantage computation.",
+    )
+    parser.add_argument(
+        "--q_adv_clip",
+        type=float,
+        default=5.0,
+        help="Absolute clipping value for normalized Q advantage.",
+    )
+    parser.add_argument(
+        "--actor_logprob_type",
+        type=str,
+        default="mean",
+        choices=["mean", "sum"],
+        help="Which actor logprob statistic to use in corrected-score selection.",
+    )
+    parser.add_argument(
+        "--q_adv_sample_temperature",
+        type=float,
+        default=1.0,
+        help=(
+            "Temperature for q_adv_logit_sample. The action is sampled from softmax(corrected_score / temperature)."
+        ),
+    )
+    parser.add_argument(
+        "--candidate_oversample_factor",
+        type=int,
+        default=3,
+        help=(
+            "Oversampling factor for q_adv_logit candidate generation. "
+            "The agent requests best_of_N * candidate_oversample_factor raw samples per round."
+        ),
+    )
+    parser.add_argument(
+        "--candidate_max_rounds",
+        type=int,
+        default=2,
+        help="Maximum number of oversampling rounds for q_adv_logit candidate generation.",
+    )
     parser.add_argument(
         "--output_dir",
         type=str,
@@ -769,6 +1560,32 @@ if __name__ == "__main__":
                         help="Keep at least this many last messages when trimming for QNet scoring.")
 
     args = parser.parse_args()
+
+    if args.best_of_N <= 0:
+        raise ValueError(f"--best_of_N must be positive, got {args.best_of_N}")
+
+    if args.candidate_oversample_factor <= 0:
+        raise ValueError(
+            "--candidate_oversample_factor must be positive, "
+            f"got {args.candidate_oversample_factor}"
+        )
+
+    if args.candidate_max_rounds <= 0:
+        raise ValueError(
+            f"--candidate_max_rounds must be positive, got {args.candidate_max_rounds}"
+        )
+
+    if args.q_adv_eps <= 0:
+        raise ValueError(f"--q_adv_eps must be positive, got {args.q_adv_eps}")
+
+    if args.q_adv_clip <= 0:
+        raise ValueError(f"--q_adv_clip must be positive, got {args.q_adv_clip}")
+
+    if args.q_adv_sample_temperature <= 0:
+        raise ValueError(
+            "--q_adv_sample_temperature must be positive, got {args.q_adv_sample_temperature}"
+        )
+
     if args.verbose:
         logger.setLevel(logging.INFO)
     elif args.debug:
