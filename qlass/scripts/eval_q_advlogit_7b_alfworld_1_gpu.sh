@@ -103,7 +103,7 @@ N_TRAJS=${N_TRAJS:-3}
 
 # Actor + Q-Adv correction:
 # corrected_score = ACTOR_LOGPROB_COEF * actor_logprob_mean + Q_ADV_BETA * zscore(QNet/env scores)
-SELECTION_STRATEGY=q_adv_logit_argmax
+SELECTION_STRATEGY=${SELECTION_STRATEGY:-q_adv_logit_argmax}
 ACTOR_LOGPROB_TYPE=mean
 ACTOR_LOGPROB_COEF=${ACTOR_LOGPROB_COEF:-1.0}
 Q_ADV_BETA=${Q_ADV_BETA:-1.0}

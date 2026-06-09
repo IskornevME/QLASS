@@ -308,7 +308,7 @@ class SGLangAgent(LMAgent):
         messages: List[dict],
         n: int,
         *,
-        add_action_candidate_prompt: bool = True,
+        add_action_candidate_prompt: bool = False,
         oversample_factor: int = 3,
         max_rounds: int = 2,
     ) -> List[Dict[str, Any]]:

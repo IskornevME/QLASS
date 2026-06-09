@@ -957,6 +957,7 @@ def main(args):
                         generated_candidates = agent.generate_candidates_with_logprobs(
                             cur_traj_state.history,
                             n=args.best_of_N,
+                            add_action_candidate_prompt=args.q_adv_add_candidate_suffix,
                             oversample_factor=args.candidate_oversample_factor,
                             max_rounds=args.candidate_max_rounds,
                         )
@@ -1520,6 +1521,14 @@ if __name__ == "__main__":
         default=1.0,
         help=(
             "Temperature for q_adv_logit_sample. The action is sampled from softmax(corrected_score / temperature)."
+        ),
+    )
+    parser.add_argument(
+        "--q_adv_add_candidate_suffix",
+        action="store_true",
+        help=(
+            "If set, append an extra action-only suffix before q_adv_logit generation. "
+            "Default is False to keep the prompt identical to classic QLASS generation."
         ),
     )
     parser.add_argument(
