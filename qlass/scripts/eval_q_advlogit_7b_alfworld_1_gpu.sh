@@ -25,8 +25,8 @@ sg_worker_port=21001
 
 mkdir -p logs_q_inf
 
-SERVER_GPU=2
-WORKER_GPU=3
+SERVER_GPU=3
+WORKER_GPU=4
 
 setsid bash -c "
   CUDA_VISIBLE_DEVICES='${SERVER_GPU}' exec python3 -m sglang.launch_server \

@@ -232,6 +232,42 @@ def recover_changed_steps_from_action_value_dict(
     }
 
 
+def aggregate_unique_candidates_per_step(
+    trajectories: Iterable[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Compute average number of saved candidate records per environment step.
+
+    In q_adv_logit mode candidates are deduplicated before evaluation, so len(step_candidates) is the actual number of unique candidates available
+    for selection at that step.
+    """
+    num_steps = 0
+    total_candidates = 0
+    min_candidates = None
+    max_candidates = None
+
+    for traj in trajectories:
+        for step_candidates in get_step_candidates(traj):
+            num_candidates = len(step_candidates)
+            if num_candidates <= 0:
+                continue
+
+            num_steps += 1
+            total_candidates += num_candidates
+
+            if min_candidates is None or num_candidates < min_candidates:
+                min_candidates = num_candidates
+            if max_candidates is None or num_candidates > max_candidates:
+                max_candidates = num_candidates
+
+    return {
+        "source": "action_value_dict",
+        "num_steps_with_candidates": num_steps,
+        "avg_unique_candidates_per_step": safe_div(total_candidates, num_steps),
+        "min_unique_candidates_per_step": min_candidates,
+        "max_unique_candidates_per_step": max_candidates,
+    }
+
+
 def print_metric_block(title: str, metrics: Dict[str, Any]) -> None:
     print()
     print(f"[{title}]")
@@ -357,12 +393,14 @@ def main() -> None:
         all_trajs,
         max_examples=args.max_changed_examples,
     )
+    unique_candidates_stats = aggregate_unique_candidates_per_step(all_trajs)
 
     print_metric_block("CORRECTION_STATS_SAVED_PER_TRAJECTORY", saved_corr)
     print_metric_block(
         "CORRECTION_STATS_RECOVERED_FROM_ACTION_VALUE_DICT",
         {k: v for k, v in recovered_corr.items() if k != "examples"},
     )
+    print_metric_block("UNIQUE_CANDIDATES_PER_STEP", unique_candidates_stats)
 
     if recovered_corr["examples"]:
         print()
@@ -382,6 +420,7 @@ def main() -> None:
         "task_metrics": task_metrics,
         "saved_correction_stats": saved_corr,
         "recovered_correction_stats": recovered_corr,
+        "unique_candidates_per_step": unique_candidates_stats,
     }
 
     if args.save_summary_json:
