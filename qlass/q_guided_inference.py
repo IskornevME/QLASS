@@ -338,6 +338,22 @@ def is_q_adv_logit_strategy(args) -> bool:
     return args.selection_strategy in {"q_adv_logit_argmax", "q_adv_logit_sample"}
 
 
+def uses_canonical_oversampled_generation(args) -> bool:
+    """Use the same candidate generator as q_adv_logit, but not necessarily the same selector.
+
+    q_argmax_oversample is the compute-matched raw-Q baseline:
+      - generate candidates with canonical prompt + oversampling + dedup;
+      - request actor logprobs for compute parity / diagnostics;
+      - ignore logprobs at selection time;
+      - select argmax(selection_score_raw).
+    """
+    return args.selection_strategy in {
+        "q_adv_logit_argmax",
+        "q_adv_logit_sample",
+        "q_argmax_oversample",
+    }
+
+
 def get_candidate_raw_selection_score(candidate: Dict[str, Any]) -> float:
     """Score used by the current QLASS selection logic.
 
@@ -953,7 +969,7 @@ def main(args):
                     #   - oversampling + dedup inside SGLangAgent;
                     #   - each candidate has actor output-token logprobs.
                     # ------------------------------------------------------------------
-                    if is_q_adv_logit_strategy(args):
+                    if uses_canonical_oversampled_generation(args):
                         generated_candidates = agent.generate_candidates_with_logprobs(
                             cur_traj_state.history,
                             n=args.best_of_N,
@@ -963,11 +979,12 @@ def main(args):
                         )
 
                         logger.info(
-                            "[GEN_QADV] task=%s traj=%d turn=%d requested_best_of_N=%d "
-                            "received_unique_candidates=%d",
+                            "[GEN_CANONICAL_OVERSAMPLE] task=%s traj=%d turn=%d strategy=%s "
+                            "requested_best_of_N=%d received_unique_candidates=%d",
                             task.task_id,
                             traj_id,
                             n_turn,
+                            args.selection_strategy,
                             args.best_of_N,
                             len(generated_candidates),
                         )
@@ -985,7 +1002,7 @@ def main(args):
                                     "finish_reason": cand.get("finish_reason"),
                                     "raw_index": cand.get("raw_index"),
                                     "round_index": cand.get("round_index"),
-                                    "generation_mode": "q_adv_logit",
+                                    "generation_mode": "canonical_oversample",
                                 }
                             )
                     else:
@@ -1477,10 +1494,11 @@ if __name__ == "__main__":
         "--selection_strategy",
         type=str,
         default="q_argmax",
-        choices=["q_argmax", "q_adv_logit_argmax", "q_adv_logit_sample"],
+        choices=["q_argmax", "q_argmax_oversample", "q_adv_logit_argmax", "q_adv_logit_sample"],
         help=(
             "Final candidate selection strategy. "
             "q_argmax keeps the original QLASS raw-Q selection. "
+            "q_argmax_oversample uses the q_adv canonical oversampling candidate generator, but selects by raw QLASS score only. "
             "q_adv_logit_argmax/q_adv_logit_sample enable canonical candidate generation with actor output logprobs; corrected-score selection is added in the next step."
         ),
     )

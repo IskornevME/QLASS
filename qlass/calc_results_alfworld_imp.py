@@ -7,6 +7,39 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 
 SLICE_RE = re.compile(r"(?P<slice_id>\d+)of(?P<slice_num>\d+)_slices_(?P<sample_mode>.+?)_traj\.jsonl$")
+_ACTION_RE = re.compile(r"Action:\s*(.*)", flags=re.IGNORECASE | re.DOTALL)
+
+
+def normalize_env_action(text: object) -> str:
+    if text is None:
+        return ""
+
+    s = str(text).strip()
+    if not s:
+        return ""
+
+    match = _ACTION_RE.search(s)
+    if match:
+        s = match.group(1).strip()
+
+    # If model generated extra text after the action, keep only the first line.
+    s = s.splitlines()[0].strip()
+
+    # Normalize harmless formatting differences.
+    s = s.rstrip(".")
+    s = " ".join(s.lower().split())
+    return s
+
+
+def extract_env_action_from_candidate(candidate: dict) -> str:
+    # Prefer parsed_action when present, but still parse it because old q_argmax
+    # can store full Thought/Action text there.
+    for key in ("parsed_action", "action", "action_text_for_env"):
+        value = candidate.get(key)
+        action = normalize_env_action(value)
+        if action:
+            return action
+    return ""
 
 
 def reward_to_float(value: Any) -> float:
@@ -232,39 +265,77 @@ def recover_changed_steps_from_action_value_dict(
     }
 
 
-def aggregate_unique_candidates_per_step(
-    trajectories: Iterable[Dict[str, Any]],
-) -> Dict[str, Any]:
-    """Compute average number of saved candidate records per environment step.
-
-    In q_adv_logit mode candidates are deduplicated before evaluation, so len(step_candidates) is the actual number of unique candidates available
-    for selection at that step.
-    """
+def aggregate_unique_candidates_per_step(trajectories):
     num_steps = 0
-    total_candidates = 0
-    min_candidates = None
-    max_candidates = None
+
+    total_candidate_records = 0
+    total_unique_env_actions = 0
+
+    min_unique_env_actions = None
+    max_unique_env_actions = None
+
+    steps_with_all_duplicate_actions = 0
+    steps_with_full_bon_unique_actions = 0
 
     for traj in trajectories:
-        for step_candidates in get_step_candidates(traj):
-            num_candidates = len(step_candidates)
-            if num_candidates <= 0:
+        for step_candidates in traj.get("action_value_dict", []):
+            if not step_candidates:
                 continue
 
             num_steps += 1
-            total_candidates += num_candidates
+            total_candidate_records += len(step_candidates)
 
-            if min_candidates is None or num_candidates < min_candidates:
-                min_candidates = num_candidates
-            if max_candidates is None or num_candidates > max_candidates:
-                max_candidates = num_candidates
+            unique_env_actions = {
+                extract_env_action_from_candidate(candidate)
+                for candidate in step_candidates
+            }
+            unique_env_actions.discard("")
+
+            n_unique = len(unique_env_actions)
+            total_unique_env_actions += n_unique
+
+            if min_unique_env_actions is None:
+                min_unique_env_actions = n_unique
+                max_unique_env_actions = n_unique
+            else:
+                min_unique_env_actions = min(min_unique_env_actions, n_unique)
+                max_unique_env_actions = max(max_unique_env_actions, n_unique)
+
+            if n_unique == 1:
+                steps_with_all_duplicate_actions += 1
+            if n_unique == len(step_candidates):
+                steps_with_full_bon_unique_actions += 1
+
+    if num_steps == 0:
+        return {
+            "source": "action_value_dict",
+            "num_steps_with_candidates": 0,
+            "avg_candidate_records_per_step": 0.0,
+            "avg_unique_candidates_per_step": 0.0,
+            "avg_unique_env_actions_per_step": 0.0,
+            "min_unique_env_actions_per_step": None,
+            "max_unique_env_actions_per_step": None,
+            "share_steps_with_all_duplicate_actions": 0.0,
+            "share_steps_with_full_bon_unique_actions": 0.0,
+        }
+
+    avg_unique_env_actions = total_unique_env_actions / num_steps
 
     return {
         "source": "action_value_dict",
         "num_steps_with_candidates": num_steps,
-        "avg_unique_candidates_per_step": safe_div(total_candidates, num_steps),
-        "min_unique_candidates_per_step": min_candidates,
-        "max_unique_candidates_per_step": max_candidates,
+
+        # Old value, useful for sanity check / compute budget.
+        "avg_candidate_records_per_step": total_candidate_records / num_steps,
+
+        # Keep old key name, but now make it mean real unique env actions.
+        "avg_unique_candidates_per_step": avg_unique_env_actions,
+        "avg_unique_env_actions_per_step": avg_unique_env_actions,
+
+        "min_unique_env_actions_per_step": min_unique_env_actions,
+        "max_unique_env_actions_per_step": max_unique_env_actions,
+        "share_steps_with_all_duplicate_actions": steps_with_all_duplicate_actions / num_steps,
+        "share_steps_with_full_bon_unique_actions": steps_with_full_bon_unique_actions / num_steps,
     }
 
 
