@@ -79,6 +79,8 @@ class QNet(nn.Module):
             pooled_logits = logits[torch.arange(batch_size, device=logits.device), :sequence_lengths[0]]
         else:
             # Select logits at the positions determined by sequence_lengths
+            # Берутся только последние non-pad токены в батче
+            # В этом случае бессмысленно считать логиты через mlp для всех токенов - можно считать только для последних
             pooled_logits = logits[torch.arange(batch_size, device=logits.device), sequence_lengths]
         # print(f'pooled_logits:{pooled_logits.shape}')
         if self.apply_sigmoid:
