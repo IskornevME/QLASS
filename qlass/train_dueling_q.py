@@ -87,6 +87,12 @@ class DataArguments:
         default=True,
         metadata={"help": "Pad value/advantage prompts to model_max_length in the collator."},
     )
+    lazy_preprocess: bool = field(
+        default=False,
+        metadata={
+            "help": "Compatibility flag with train_q.py. Dueling data is tokenized in the collator, so this flag is currently ignored."
+        },
+    )
 
 
 @dataclass
