@@ -105,23 +105,82 @@ class TrainingArguments(transformers.TrainingArguments):
     )
 
 
-def trainer_save_model_safe(trainer: transformers.Trainer) -> None:
-    """Save model safely in single-GPU and FSDP settings.
+def verify_saved_dueling_checkpoint(
+    output_dir: str,
+    *,
+    hidden_size: int,
+    vocab_size: int,
+    head_hidden_size: int,
+) -> None:
+    """Fail fast if saved checkpoint is not a normal loadable DuelingQNet state dict."""
+    model_path = os.path.join(output_dir, "pytorch_model.bin")
+    config_path = os.path.join(output_dir, "config.json")
+    dueling_config_path = os.path.join(output_dir, "dueling_qnet_config.json")
 
-    This mirrors the helper used by ``train_q.py``. ``DuelingQNet`` implements ``save_pretrained``, so ``trainer.save_model`` will call it correctly.
-    """
-    try:
-        from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-        from torch.distributed.fsdp import FullStateDictConfig, StateDictType
+    if not os.path.exists(model_path):
+        raise FileNotFoundError(f"Missing {model_path}")
+    if not os.path.exists(config_path):
+        raise FileNotFoundError(f"Missing {config_path}")
+    if not os.path.exists(dueling_config_path):
+        raise FileNotFoundError(f"Missing {dueling_config_path}")
 
-        if isinstance(trainer.model, FSDP):
-            save_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
-            with FSDP.state_dict_type(trainer.model, StateDictType.FULL_STATE_DICT, save_policy):
-                trainer.save_model()
-        else:
-            trainer.save_model()
-    except Exception:
-        trainer.save_model()
+    sd = torch.load(model_path, map_location="cpu")
+
+    expected_shapes = {
+        "llama.model.embed_tokens.weight": (vocab_size, hidden_size),
+        "llama.lm_head.weight": (vocab_size, hidden_size),
+        "value_head.0.weight": (head_hidden_size, hidden_size),
+        "value_head.0.bias": (head_hidden_size,),
+        "value_head.2.weight": (head_hidden_size, head_hidden_size),
+        "value_head.2.bias": (head_hidden_size,),
+        "value_head.4.weight": (1, head_hidden_size),
+        "advantage_head.0.weight": (head_hidden_size, hidden_size),
+        "advantage_head.0.bias": (head_hidden_size,),
+        "advantage_head.2.weight": (head_hidden_size, head_hidden_size),
+        "advantage_head.2.bias": (head_hidden_size,),
+        "advantage_head.4.weight": (1, head_hidden_size),
+    }
+
+    bad = []
+    for key, expected_shape in expected_shapes.items():
+        if key not in sd:
+            bad.append(f"{key}: missing")
+            continue
+        actual_shape = tuple(sd[key].shape)
+        if actual_shape != expected_shape:
+            bad.append(f"{key}: expected {expected_shape}, got {actual_shape}")
+
+    if bad:
+        raise RuntimeError(
+            "Saved checkpoint is not loadable as a normal DuelingQNet:\n"
+            + "\n".join(bad)
+        )
+
+    print(f"[verify_saved_dueling_checkpoint] OK: {output_dir}")
+
+
+def trainer_save_model_safe(
+    trainer: transformers.Trainer,
+    *,
+    hidden_size: int,
+    vocab_size: int,
+    head_hidden_size: int,
+) -> None:
+    """Final save for DDP/non-FSDP DuelingQNet."""
+    if trainer.is_fsdp_enabled:
+        raise RuntimeError(
+            "FSDP is disabled for DuelingQNet. Use torchrun DDP without --fsdp."
+        )
+
+    trainer.save_model()
+
+    if trainer.is_world_process_zero():
+        verify_saved_dueling_checkpoint(
+            trainer.args.output_dir,
+            hidden_size=hidden_size,
+            vocab_size=vocab_size,
+            head_hidden_size=head_hidden_size,
+        )
 
 
 def _validate_training_setup(training_args: TrainingArguments) -> None:
@@ -146,6 +205,13 @@ def _validate_training_setup(training_args: TrainingArguments) -> None:
             "[train_dueling_q] Forcing remove_unused_columns=False for dueling batches."
         )
         training_args.remove_unused_columns = False
+
+    if bool(getattr(training_args, "fsdp", None)):
+        raise ValueError(
+            "Do not use --fsdp for DuelingQNet in the current implementation. "
+            "Use multi-GPU DDP via torchrun without --fsdp. "
+            "The previous FSDP path produced non-loadable rank-local checkpoints."
+        )
 
 
 def train() -> None:
@@ -226,10 +292,13 @@ def train() -> None:
 
     model.config.use_cache = True
     trainer.save_state()
-    if trainer.is_deepspeed_enabled:
-        trainer.save_model()
-    else:
-        trainer_save_model_safe(trainer)
+
+    trainer_save_model_safe(
+        trainer,
+        hidden_size=int(config.hidden_size),
+        vocab_size=int(config.vocab_size),
+        head_hidden_size=int(model_args.dueling_head_hidden_size),
+    )
 
 
 if __name__ == "__main__":

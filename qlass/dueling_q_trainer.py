@@ -13,6 +13,7 @@ So the trainer's main job is to:
 """
 from typing import Any, Dict, Optional, Tuple, Union
 
+import os
 import torch
 from torch import nn
 from transformers import Trainer
@@ -133,6 +134,47 @@ class DuelingQTrainer(Trainer):
                 logs.setdefault(key, value)
 
         return super().log(logs, *args, **kwargs)
+
+    def _save(self, output_dir: Optional[str] = None, state_dict=None) -> None:
+        """Save DuelingQNet checkpoints in a normal loadable format.
+
+        This path supports normal multi-GPU DDP. It intentionally rejects FSDP, because FSDP previously produced non-loadable rank-local/flattened tensors.
+
+        Saved files:
+          - pytorch_model.bin
+          - config.json
+          - dueling_qnet_config.json
+          - tokenizer files
+          - training_args.bin
+        """
+        output_dir = output_dir if output_dir is not None else self.args.output_dir
+        os.makedirs(output_dir, exist_ok=True)
+
+        if self.is_fsdp_enabled:
+            raise RuntimeError(
+                "FSDP saving is disabled for DuelingQNet. "
+                "Use multi-GPU DDP via torchrun, but remove --fsdp."
+            )
+
+        # In DDP this unwraps DistributedDataParallel -> DuelingQNet.
+        model = self.accelerator.unwrap_model(self.model)
+
+        # Important: use the unwrapped model state_dict, not a sharded/flattened one.
+        if state_dict is None:
+            state_dict = model.state_dict()
+
+        if self.args.should_save:
+            model.save_pretrained(
+                output_dir,
+                is_main_process=True,
+                save_function=torch.save,
+                state_dict=state_dict,
+            )
+
+            if self.tokenizer is not None:
+                self.tokenizer.save_pretrained(output_dir)
+
+            torch.save(self.args, os.path.join(output_dir, "training_args.bin"))
 
     def prediction_step(
         self,

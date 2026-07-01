@@ -136,6 +136,13 @@ class DuelingQNet(nn.Module):
                 **from_pretrained_kwargs,
             )
 
+        # Critic uses hidden states only. The LM head is not part of the Q/V/A computation, so keep it frozen. This avoids DDP unused-parameter
+        # issues and saves optimizer memory.
+        freeze_lm_head = bool(_getattr_or_default(model_args, "freeze_lm_head", True))
+        if freeze_lm_head and hasattr(self.llama, "lm_head"):
+            for p in self.llama.lm_head.parameters():
+                p.requires_grad_(False)
+
         self.config = self.llama.config
         if pad_token_id is not None:
             self.config.pad_token_id = int(pad_token_id)
@@ -163,6 +170,7 @@ class DuelingQNet(nn.Module):
             "hidden_size": self.hidden_size,
             "head_hidden_size": self.head_hidden_size,
             "value_loss_coef": self.value_loss_coef,
+            "freeze_lm_head": freeze_lm_head,
         }
 
     @staticmethod
@@ -192,13 +200,34 @@ class DuelingQNet(nn.Module):
         return hidden_states[torch.arange(batch_size, device=hidden_states.device), last_indices]
 
     def _encode_and_pool(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
-        outputs = self.llama(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            output_hidden_states=True,
-            use_cache=False,
-        )
-        last_hidden = outputs.hidden_states[-1]
+        """Encode prompts and pool the last non-pad hidden state.
+
+        Use the underlying decoder backbone directly instead of AutoModelForCausalLM.forward().
+        The critic only needs hidden states; computing lm_head logits is unnecessary.
+        """
+        if hasattr(self.llama, "model"):
+            outputs = self.llama.model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                output_hidden_states=True,
+                use_cache=False,
+            )
+        else:
+            # Fallback for non-Llama CausalLM classes.
+            outputs = self.llama(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                output_hidden_states=True,
+                use_cache=False,
+            )
+
+        if hasattr(outputs, "hidden_states") and outputs.hidden_states is not None:
+            last_hidden = outputs.hidden_states[-1]
+        elif hasattr(outputs, "last_hidden_state"):
+            last_hidden = outputs.last_hidden_state
+        else:
+            raise RuntimeError("Backbone output does not contain hidden states.")
+
         return self._last_non_pad_pool(last_hidden, attention_mask)
 
     def _encode_value_and_advantage(
@@ -391,11 +420,14 @@ class DuelingQNet(nn.Module):
         args.model_name_or_path = load_directory
 
         value_loss_coef = None
+        head_hidden_size = 1024
+
         dueling_config_path = Path(load_directory) / "dueling_qnet_config.json"
         if dueling_config_path.exists():
             with open(dueling_config_path, "r", encoding="utf-8") as f:
                 dueling_config = json.load(f)
             value_loss_coef = float(dueling_config.get("value_loss_coef", 0.1))
+            head_hidden_size = int(dueling_config.get("head_hidden_size", 1024))
 
         class _LoadTrainingArgs:
             # QLASS QNet checkpoints are normally trained/served in bf16.  Keep
@@ -412,6 +444,7 @@ class DuelingQNet(nn.Module):
             model_args=args,
             training_args=_LoadTrainingArgs(),
             value_loss_coef=value_loss_coef,
+            head_hidden_size=head_hidden_size,
         )
 
         state_dict_path = os.path.join(load_directory, "pytorch_model.bin")

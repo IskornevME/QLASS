@@ -46,11 +46,12 @@ drop_state_mismatch=${DROP_STATE_MISMATCH:-False}
 logging_steps=${LOGGING_STEPS:-5}
 eval_steps=${EVAL_STEPS:-200}
 save_steps=${SAVE_STEPS:-200}
-save_total_limit=${SAVE_TOTAL_LIMIT:-2}
+save_total_limit=${SAVE_TOTAL_LIMIT:-3}
 
 # Unique run id. You can override it, e.g. RUN_ID=raw_lr1e-5_vcoef0.1_seed42.
 timestamp=$(date +%Y%m%d_%H%M%S)
 run_id=${RUN_ID:-raw_lr${learning_rate}_bs${batch_size}_vcoef${dueling_value_loss_coef}_seed${seed}_${timestamp}}
+# run_id=raw_lr1e-5_bs64_vcoef0.1_seed42_20260630_120921
 
 # Directory layout:
 #   <experiment_root>/runs/<run_id>/          final model + checkpoints + trainer state
@@ -107,14 +108,14 @@ CUDA_VISIBLE_DEVICES=1,2 python -m torch.distributed.run \
     --warmup_ratio "${warmup_ratio}" \
     --lr_scheduler_type "${lr_scheduler_type}" \
     --logging_steps "${logging_steps}" \
-    --fsdp "full_shard auto_wrap" \
-    --fsdp_transformer_layer_cls_to_wrap 'LlamaDecoderLayer' \
     --tf32 True \
     --model_max_length 4096 \
     --gradient_checkpointing True \
     --lazy_preprocess False \
     --remove_unused_columns False \
     --seed "${seed}" \
+    --save_safetensors False \
+    --ddp_find_unused_parameters False \
     --dueling_value_loss_coef "${dueling_value_loss_coef}" \
     --dueling_head_hidden_size "${dueling_head_hidden_size}" \
     --min_candidates "${min_candidates}" \
