@@ -25,8 +25,8 @@ sg_worker_port=21001
 
 mkdir -p logs_q_inf
 
-SERVER_GPU=2
-WORKER_GPU=3
+SERVER_GPU=1
+WORKER_GPU=2
 
 setsid bash -c "
   CUDA_VISIBLE_DEVICES='${SERVER_GPU}' exec python3 -m sglang.launch_server \
@@ -103,9 +103,29 @@ N_TRAJS=${N_TRAJS:-3}
 
 # Actor + Q-Adv correction:
 # corrected_score = ACTOR_LOGPROB_COEF * actor_logprob_mean + Q_ADV_BETA * zscore(QNet/env scores)
-SELECTION_STRATEGY=${SELECTION_STRATEGY:-q_adv_logit_argmax}
+SELECTION_STRATEGY=${SELECTION_STRATEGY:-dueling_adv_logit_argmax}
+DUELING_QNET_PATH=${DUELING_QNET_PATH:-"${save_dir}qlass-Llama-2-7b-chat-hf-alfworld-DuelingQ-raw/runs/raw_lr1e-5_bs64_vcoef0.1_seed42_20260702_045546/checkpoint-1034"}
+DUELING_PROMPT_MODEL_NAME=${DUELING_PROMPT_MODEL_NAME:-"${save_dir}${sft_model_name}"}
+DUELING_ADVANTAGE_NORM=${DUELING_ADVANTAGE_NORM:-zscore}
+if [[ "${SELECTION_STRATEGY}" == dueling_adv_logit_* ]]; then
+  if [[ ! -f "${DUELING_QNET_PATH}/pytorch_model.bin" ]]; then
+    echo "[ERROR] Missing DuelingQNet weights: ${DUELING_QNET_PATH}/pytorch_model.bin"
+    exit 1
+  fi
+
+  if [[ ! -f "${DUELING_QNET_PATH}/config.json" ]]; then
+    echo "[ERROR] Missing DuelingQNet config: ${DUELING_QNET_PATH}/config.json"
+    exit 1
+  fi
+
+  if [[ ! -f "${DUELING_QNET_PATH}/dueling_qnet_config.json" ]]; then
+    echo "[ERROR] Missing DuelingQNet config: ${DUELING_QNET_PATH}/dueling_qnet_config.json"
+    exit 1
+  fi
+fi
+
 ACTOR_LOGPROB_TYPE=mean
-ACTOR_LOGPROB_COEF=${ACTOR_LOGPROB_COEF:-1.0}
+ACTOR_LOGPROB_COEF=${ACTOR_LOGPROB_COEF:-0.0}
 Q_ADV_BETA=${Q_ADV_BETA:-1.0}
 Q_ADV_EPS=${Q_ADV_EPS:-1e-6}
 Q_ADV_CLIP=${Q_ADV_CLIP:-5.0}
@@ -118,7 +138,7 @@ CANDIDATE_MAX_ROUNDS=${CANDIDATE_MAX_ROUNDS:-1}
 slice_num="${NUM_WORKERS}"
 slice_id=0
 
-OUT_DIR="data/train/${task}/${explore_model_name}/q_advlogit/${data_prefix}_${SELECTION_STRATEGY}_bon${BON}_beta${Q_ADV_BETA}_actor${ACTOR_LOGPROB_COEF}_${ACTOR_LOGPROB_TYPE}_oversample${CANDIDATE_OVERSAMPLE_FACTOR}x${CANDIDATE_MAX_ROUNDS}_workers${NUM_WORKERS}_ntrajs${N_TRAJS}_${SPLT}_run_${RUN_ID}/"
+OUT_DIR="data/train/${task}/${explore_model_name}/dueling_adv/${data_prefix}_${SELECTION_STRATEGY}_bon${BON}_beta${Q_ADV_BETA}_actor${ACTOR_LOGPROB_COEF}_${ACTOR_LOGPROB_TYPE}_oversample${CANDIDATE_OVERSAMPLE_FACTOR}x${CANDIDATE_MAX_ROUNDS}_workers${NUM_WORKERS}_ntrajs${N_TRAJS}_${SPLT}_run_${RUN_ID}/"
 mkdir -p "${OUT_DIR}"
 
 RUN_LOG="${OUT_DIR}/q_guided_inference.log"
@@ -137,7 +157,14 @@ for slice_id in $(seq 0 $((NUM_WORKERS - 1))); do
     CUDA_VISIBLE_DEVICES="${worker_gpu}" python qlass/q_guided_inference.py \
       --agent_config "${agent_cfg}" \
       --agent_path qlass/configs/model/ \
-      --qnet_path "${save_dir}${q_model_name_checkpoint}" \
+      --dueling_qnet_path "${DUELING_QNET_PATH}" \
+      --dueling_tokenizer_path "${DUELING_QNET_PATH}" \
+      --dueling_prompt_model_name "${DUELING_PROMPT_MODEL_NAME}" \
+      --dueling_model_max_length 4096 \
+      --dueling_pad_to_max_length \
+      --dueling_truncation_side left \
+      --dueling_advantage_norm "${DUELING_ADVANTAGE_NORM}" \
+      --dueling_bf16 \
       --exp_name "${exp_name}" \
       --exp_path qlass/configs/task/ \
       --exp_config "${task}" \

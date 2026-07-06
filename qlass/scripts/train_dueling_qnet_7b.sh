@@ -46,7 +46,7 @@ drop_state_mismatch=${DROP_STATE_MISMATCH:-False}
 logging_steps=${LOGGING_STEPS:-5}
 eval_steps=${EVAL_STEPS:-200}
 save_steps=${SAVE_STEPS:-200}
-save_total_limit=${SAVE_TOTAL_LIMIT:-3}
+save_total_limit=${SAVE_TOTAL_LIMIT:-2}
 
 # Unique run id. You can override it, e.g. RUN_ID=raw_lr1e-5_vcoef0.1_seed42.
 timestamp=$(date +%Y%m%d_%H%M%S)

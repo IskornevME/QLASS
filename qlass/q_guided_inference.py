@@ -20,6 +20,8 @@ import random
 import copy
 # from model.q_network import QNet
 from qlass.q_network import QNet
+from qlass.dueling_q_network import DuelingQNet
+from qlass.dueling_data import build_prompt_from_conversations
 
 try:
     from eval.hotpotqa.zeno_build.models import lm_config
@@ -30,6 +32,7 @@ import random
 import torch
 import numpy as np
 from rich import print
+from transformers import AutoTokenizer
 from qlass.explore_sft_agent import TreeNode
 
 
@@ -335,7 +338,36 @@ def _force_min_max_steps(env, min_steps: int) -> int:
 
 
 def is_q_adv_logit_strategy(args) -> bool:
+    """Old QNet/env-score z-score + actor-logprob strategy."""
     return args.selection_strategy in {"q_adv_logit_argmax", "q_adv_logit_sample"}
+
+
+def is_dueling_adv_logit_strategy(args) -> bool:
+    """New DuelingQNet advantage + actor-logprob strategy."""
+    return args.selection_strategy in {
+        "dueling_adv_logit_argmax",
+        "dueling_adv_logit_sample",
+    }
+
+
+def is_corrected_logit_strategy(args) -> bool:
+    """Any strategy that fills corrected_score and then selects from it."""
+    return is_q_adv_logit_strategy(args) or is_dueling_adv_logit_strategy(args)
+
+
+def uses_legacy_qnet(args) -> bool:
+    """Whether we need to load/evaluate the old scalar QNet."""
+    return args.selection_strategy in {
+        "q_argmax",
+        "q_argmax_oversample",
+        "q_adv_logit_argmax",
+        "q_adv_logit_sample",
+    }
+
+
+def uses_dueling_qnet(args) -> bool:
+    """Whether we need to load/evaluate the new DuelingQNet."""
+    return is_dueling_adv_logit_strategy(args)
 
 
 def uses_canonical_oversampled_generation(args) -> bool:
@@ -351,6 +383,8 @@ def uses_canonical_oversampled_generation(args) -> bool:
         "q_adv_logit_argmax",
         "q_adv_logit_sample",
         "q_argmax_oversample",
+        "dueling_adv_logit_argmax",
+        "dueling_adv_logit_sample",
     }
 
 
@@ -384,6 +418,252 @@ def get_candidate_actor_logprob(candidate: Dict[str, Any], args) -> float:
         )
 
     return float(value)
+
+
+def openai_messages_to_qlass_conversations(messages: List[Dict[str, Any]]) -> List[Dict[str, str]]:
+    """Convert runtime state history from {'role', 'content'} to QLASS {'from', 'value'}.
+
+    DuelingQNet was trained on QLASS-style conversations:
+        human / gpt
+    whereas environment runtime history uses OpenAI-style:
+        user / assistant
+    """
+    role_map = {
+        "user": "human",
+        "assistant": "gpt",
+    }
+
+    conversations: List[Dict[str, str]] = []
+
+    for msg in messages:
+        role = msg.get("role")
+        if role == "system":
+            # Current ALFWorld histories should not contain system messages, but
+            # skipping them keeps the converter robust.
+            continue
+
+        if role not in role_map:
+            raise ValueError(f"Unsupported message role for dueling critic: {role!r}")
+
+        content = msg.get("content")
+        if content is None:
+            continue
+
+        conversations.append(
+            {
+                "from": role_map[role],
+                "value": str(content),
+            }
+        )
+
+    if not conversations:
+        raise ValueError("Cannot build dueling critic input from empty conversation history.")
+
+    # At action-selection time, the state should normally end with the current
+    # human/user observation, before the next assistant action is appended.
+    if conversations[-1]["from"] != "human":
+        raise ValueError(
+            "Dueling critic state must end with a human/user message before candidate action. "
+            f"Last message: {conversations[-1]}"
+        )
+
+    return conversations
+
+
+@torch.no_grad()
+def evaluate_candidates_dueling_qnet(
+    model: DuelingQNet,
+    tokenizer,
+    state_history: List[Dict[str, Any]],
+    candidate_records: List[Dict[str, Any]],
+    args,
+) -> Dict[str, Any]:
+    """Evaluate DuelingQNet advantages for all candidates of one state.
+
+    The model input mirrors training:
+      value input: state only
+      advantage input i: state + candidate_i assistant action
+
+    We use centered_advantages as the critic signal and optionally normalize it
+    inside the current candidate set before mixing with actor logprobs.
+    """
+    if not candidate_records:
+        raise RuntimeError("[DUELING_ADV] Cannot evaluate empty candidate list.")
+
+    # DuelingQNet.forward currently expects K >= 2. If generation produced only one unique action, there is no meaningful within-set advantage normalization.
+    if len(candidate_records) < 2:
+        logger.warning(
+            "[DUELING_ADV] Only one candidate is available. Setting dueling advantage to 0."
+        )
+        actor_logprob = get_candidate_actor_logprob(candidate_records[0], args)
+        candidate_records[0]["dueling_value"] = None
+        candidate_records[0]["dueling_advantage_raw"] = 0.0
+        candidate_records[0]["dueling_advantage_centered"] = 0.0
+        candidate_records[0]["dueling_advantage_norm"] = 0.0
+        candidate_records[0]["dueling_adv_mean"] = 0.0
+        candidate_records[0]["dueling_adv_std"] = 0.0
+        candidate_records[0]["q_mean"] = 0.0
+        candidate_records[0]["q_std"] = 0.0
+        candidate_records[0]["q_advantage"] = 0.0
+        candidate_records[0]["actor_logprob_used"] = float(actor_logprob)
+        candidate_records[0]["corrected_score"] = float(args.actor_logprob_coef * actor_logprob)
+        return {
+            "dueling_adv_mean": 0.0,
+            "dueling_adv_std": 0.0,
+            "num_candidates": 1,
+        }
+
+    device = next(model.parameters()).device
+
+    state_conversations = openai_messages_to_qlass_conversations(state_history)
+
+    prompt_model_name = (
+        args.dueling_prompt_model_name
+        if args.dueling_prompt_model_name is not None
+        else args.model_name
+    )
+
+    value_prompt = build_prompt_from_conversations(
+        state_conversations,
+        model_path=prompt_model_name,
+        add_generation_prompt=True,
+    )
+
+    adv_prompts: List[str] = []
+    for cand in candidate_records:
+        # Use exactly the text sent to env.step, not the parsed action line.
+        action_text = str(cand["action_text_for_env"])
+        adv_conversation = state_conversations + [
+            {
+                "from": "gpt",
+                "value": action_text,
+            }
+        ]
+        adv_prompts.append(
+            build_prompt_from_conversations(
+                adv_conversation,
+                model_path=prompt_model_name,
+                add_generation_prompt=False,
+            )
+        )
+
+    padding = "max_length" if args.dueling_pad_to_max_length else True
+
+    # Safety: keep the recent observation and candidate action if the prompt is too long. This is more important than perfectly matching right truncation,
+    # because dropping the candidate action would make A(s,a) meaningless.
+    old_trunc_side = getattr(tokenizer, "truncation_side", "right")
+    tokenizer.truncation_side = args.dueling_truncation_side
+
+    try:
+        value_tokens = tokenizer(
+            [value_prompt],
+            return_tensors="pt",
+            padding=padding,
+            max_length=args.dueling_model_max_length,
+            truncation=True,
+        )
+        adv_tokens = tokenizer(
+            adv_prompts,
+            return_tensors="pt",
+            padding=padding,
+            max_length=args.dueling_model_max_length,
+            truncation=True,
+        )
+    finally:
+        tokenizer.truncation_side = old_trunc_side
+
+    batch = {
+        "value_input_ids": value_tokens["input_ids"].to(device),
+        "value_attention_mask": value_tokens["attention_mask"].to(device),
+        "adv_input_ids": adv_tokens["input_ids"].to(device),
+        "adv_attention_mask": adv_tokens["attention_mask"].to(device),
+        "candidate_mask": torch.ones(len(candidate_records), dtype=torch.bool, device=device),
+    }
+
+    outputs = model(**batch)
+
+    raw_adv = outputs["advantages"].detach().float().cpu().numpy().astype(np.float64)
+    centered_adv = outputs["centered_advantages"].detach().float().cpu().numpy().astype(np.float64)
+
+    # Since centered_advantages = A_i - mean_j A_j, its mean should be close to 0.
+    adv_mean = float(np.mean(raw_adv))
+    centered_std = float(np.std(centered_adv))
+
+    if args.dueling_advantage_norm == "zscore":
+        if centered_std <= args.q_adv_eps:
+            logger.warning(
+                "[DUELING_ADV] Degenerate centered advantage distribution: "
+                "num_candidates=%d std=%.6f eps=%.6f. Setting normalized advantages to 0.",
+                len(candidate_records),
+                centered_std,
+                args.q_adv_eps,
+            )
+            norm_adv = np.zeros_like(centered_adv, dtype=np.float64)
+        else:
+            norm_adv = centered_adv / (centered_std + args.q_adv_eps)
+
+    elif args.dueling_advantage_norm == "centered":
+        norm_adv = centered_adv
+
+    elif args.dueling_advantage_norm == "none":
+        norm_adv = raw_adv
+
+    else:
+        raise ValueError(
+            f"Unsupported --dueling_advantage_norm={args.dueling_advantage_norm!r}"
+        )
+
+    norm_adv = np.clip(norm_adv, -args.q_adv_clip, args.q_adv_clip)
+
+    value_pred = float(outputs["value"].detach().float().cpu().item())
+
+    for cand, raw_a, centered_a, norm_a in zip(
+        candidate_records,
+        raw_adv.tolist(),
+        centered_adv.tolist(),
+        norm_adv.tolist(),
+    ):
+        actor_logprob = get_candidate_actor_logprob(cand, args)
+
+        corrected_score = (
+            args.actor_logprob_coef * actor_logprob
+            + args.q_adv_beta * float(norm_a)
+        )
+
+        cand["dueling_value"] = value_pred
+        cand["dueling_advantage_raw"] = float(raw_a)
+        cand["dueling_advantage_centered"] = float(centered_a)
+        cand["dueling_advantage_norm"] = float(norm_a)
+        cand["dueling_adv_mean"] = adv_mean
+        cand["dueling_adv_std"] = centered_std
+
+        # Reuse existing generic fields so current selectors/loggers keep working.
+        cand["q_mean"] = adv_mean
+        cand["q_std"] = centered_std
+        cand["q_advantage"] = float(norm_a)
+        cand["actor_logprob_used"] = float(actor_logprob)
+        cand["corrected_score"] = float(corrected_score)
+
+    logger.info(
+        "[DUELING_ADV] Computed dueling corrected scores: num_candidates=%d "
+        "value=%.6f adv_mean=%.6f centered_std=%.6f norm=%s "
+        "actor_coef=%.6f beta=%.6f clip=%.6f",
+        len(candidate_records),
+        value_pred,
+        adv_mean,
+        centered_std,
+        args.dueling_advantage_norm,
+        args.actor_logprob_coef,
+        args.q_adv_beta,
+        args.q_adv_clip,
+    )
+
+    return {
+        "dueling_value": value_pred,
+        "dueling_adv_mean": adv_mean,
+        "dueling_adv_std": centered_std,
+        "num_candidates": len(candidate_records),
+    }
 
 
 def compute_q_advantage_and_corrected_scores(
@@ -478,7 +758,7 @@ def select_candidate_q_adv_logit(
     if not candidate_records:
         raise RuntimeError("[q_guided_inference] Cannot select from empty candidate_records.")
 
-    if args.selection_strategy == "q_adv_logit_argmax":
+    if args.selection_strategy in {"q_adv_logit_argmax", "dueling_adv_logit_argmax"}:
         selected = max(candidate_records, key=get_candidate_corrected_score)
         logger.info(
             "[SELECT_CORRECTED] argmax selected idx=%s action=%r corrected=%.6f "
@@ -492,7 +772,7 @@ def select_candidate_q_adv_logit(
         )
         return selected
 
-    if args.selection_strategy == "q_adv_logit_sample":
+    if args.selection_strategy in {"q_adv_logit_sample", "dueling_adv_logit_sample"}:
         scores = np.array(
             [get_candidate_corrected_score(candidate) for candidate in candidate_records],
             dtype=np.float64,
@@ -572,7 +852,7 @@ def compute_and_mark_selection_diagnostics(
 
     raw_best = max(candidate_records, key=get_candidate_raw_selection_score)
 
-    if is_q_adv_logit_strategy(args):
+    if is_corrected_logit_strategy(args):
         corrected_argmax = max(candidate_records, key=get_candidate_corrected_score)
     else:
         corrected_argmax = None
@@ -598,6 +878,8 @@ def compute_and_mark_selection_diagnostics(
 
     diagnostics = {
         "is_q_adv_logit_strategy": bool(is_q_adv_logit_strategy(args)),
+        "is_dueling_adv_logit_strategy": bool(is_dueling_adv_logit_strategy(args)),
+        "is_corrected_logit_strategy": bool(is_corrected_logit_strategy(args)),
         "selection_strategy": args.selection_strategy,
 
         "raw_best_idx": raw_best_idx,
@@ -645,6 +927,12 @@ def sync_action_value_dict_with_candidate_records(
         item["q_mean"] = candidate.get("q_mean")
         item["q_std"] = candidate.get("q_std")
         item["q_advantage"] = candidate.get("q_advantage")
+        item["dueling_value"] = candidate.get("dueling_value")
+        item["dueling_advantage_raw"] = candidate.get("dueling_advantage_raw")
+        item["dueling_advantage_centered"] = candidate.get("dueling_advantage_centered")
+        item["dueling_advantage_norm"] = candidate.get("dueling_advantage_norm")
+        item["dueling_adv_mean"] = candidate.get("dueling_adv_mean")
+        item["dueling_adv_std"] = candidate.get("dueling_adv_std")
         item["actor_logprob_used"] = candidate.get("actor_logprob_used")
         item["corrected_score"] = candidate.get("corrected_score")
         item["selected"] = bool(candidate.get("selected", False))
@@ -721,7 +1009,8 @@ def log_candidate_records(
         logger.info(
             "[CANDIDATE] task=%s traj=%d turn=%d idx=%s action=%r "
             "finished=%s env_reward=%s raw_score=%.6f q_score=%s "
-            "q_mean=%s q_std=%s q_advantage=%s corrected_score=%s "
+            "q_mean=%s q_std=%s q_advantage=%s dueling_adv_raw=%s dueling_adv_centered=%s dueling_adv_norm=%s "
+            "dueling_value=%s corrected_score=%s "
             "actor_logprob_used=%s actor_logprob_mean=%s actor_logprob_sum=%s "
             "num_tokens=%s selected=%s selected_by_raw_q=%s selected_by_final_policy=%s generation_mode=%s raw_index=%s round_index=%s",
             task_id,
@@ -736,6 +1025,10 @@ def log_candidate_records(
             cand.get("q_mean"),
             cand.get("q_std"),
             cand.get("q_advantage"),
+            cand.get("dueling_advantage_raw"),
+            cand.get("dueling_advantage_centered"),
+            cand.get("dueling_advantage_norm"),
+            cand.get("dueling_value"),
             cand.get("corrected_score"),
             cand.get("actor_logprob_used"),
             cand.get("actor_logprob_mean"),
@@ -805,31 +1098,87 @@ def main(args):
         "num_q_adv_steps": 0,
         "num_raw_vs_selected_changed": 0,
     }
-    
-    args.model_name_or_path = args.qnet_path
-    args.low_cpu_mem_usage = False
-    args.use_flash_attn = True
-    qnet = QNet.from_pretrained(args.qnet_path,None,args)
-    qnet = qnet.to("cuda")
-    qnet.device = torch.device("cuda")
 
-    qnet.mode = "final"
-    qnet.eval()
+    qnet = None
+    dueling_qnet = None
+    dueling_tokenizer = None
 
-    print("loaded qnet successfully")
+    # Load agent config before resolving tokenizer paths.
+    with open(os.path.join(args.agent_path, f"{args.agent_config}.json")) as f:
+        agent_config: Dict[str, Any] = json.load(f)
+
+    if uses_legacy_qnet(args):
+        if args.qnet_path is None:
+            raise ValueError(f"--qnet_path is required for selection_strategy={args.selection_strategy}")
+
+        args.model_name_or_path = args.qnet_path
+        args.low_cpu_mem_usage = False
+        args.use_flash_attn = True
+
+        qnet = QNet.from_pretrained(args.qnet_path, None, args)
+        qnet = qnet.to("cuda")
+        qnet.device = torch.device("cuda")
+        qnet.mode = "final"
+        qnet.eval()
+
+        print("loaded legacy qnet successfully")
+
+    if uses_dueling_qnet(args):
+        dueling_path = args.dueling_qnet_path or args.qnet_path
+        if dueling_path is None:
+            raise ValueError(
+                f"--dueling_qnet_path or --qnet_path is required for "
+                f"selection_strategy={args.selection_strategy}"
+            )
+
+        dueling_load_args = argparse.Namespace(
+            bf16=bool(args.dueling_bf16),
+            fp16=bool(args.dueling_fp16),
+        )
+
+        dueling_qnet = DuelingQNet.from_pretrained(
+            dueling_path,
+            accelerator=None,
+            args=dueling_load_args,
+        )
+        dueling_qnet = dueling_qnet.to("cuda")
+        dueling_qnet.eval()
+
+        dueling_tokenizer_path = args.dueling_tokenizer_path or dueling_path
+        dueling_tokenizer = AutoTokenizer.from_pretrained(
+            dueling_tokenizer_path,
+            model_max_length=args.dueling_model_max_length,
+            use_fast=False,
+        )
+        if dueling_tokenizer.pad_token != dueling_tokenizer.unk_token:
+            dueling_tokenizer.pad_token = dueling_tokenizer.unk_token
+        if dueling_tokenizer.pad_token_id is None:
+            raise ValueError("Dueling tokenizer must have pad_token_id.")
+
+        print(f"loaded dueling qnet successfully from {dueling_path}")
+
     # from transformers import AutoTokenizer
     # tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path,
     #                                             model_max_length=4096,
     #                                             use_fast=False)
     # Tokenizer MUST match the SFT model (same chat template/tokenizer as action generator)
-    from transformers import AutoTokenizer
     # Resolve tokenizer path: explicit arg > agent_config tokenizer_path > args.model_name
-    with open(os.path.join(args.agent_path, f"{args.agent_config}.json")) as f:
-        agent_config: Dict[str, Any] = json.load(f)
-    tokenizer_path = args.tokenizer_path or agent_config.get("config", {}).get("tokenizer_path") or args.model_name
-    tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, model_max_length=4096, use_fast=False)
-    if tokenizer.pad_token != tokenizer.unk_token:
-        tokenizer.pad_token = tokenizer.unk_token
+    tokenizer = None
+    if qnet is not None:
+        # Tokenizer for legacy QNet scoring.
+        tokenizer_path = (
+            args.tokenizer_path
+            or agent_config.get("config", {}).get("tokenizer_path")
+            or args.model_name
+        )
+        tokenizer = AutoTokenizer.from_pretrained(
+            tokenizer_path,
+            model_max_length=4096,
+            use_fast=False,
+        )
+        if tokenizer.pad_token != tokenizer.unk_token:
+            tokenizer.pad_token = tokenizer.unk_token
+
     random.seed(42)
 
     with open(os.path.join(args.exp_path, f"{args.exp_config}.json")) as f:
@@ -842,9 +1191,10 @@ def main(args):
         agent_config['config']['batch_size'] = args.eval_batch_size
 
     # Attach QNet trimming caps to the model instance (used inside evaluate_trajs_qnet_v2)
-    qnet._qnet_max_prompt_tokens = args.qnet_max_prompt_tokens
-    qnet._qnet_keep_first_n = args.qnet_keep_first_n
-    qnet._qnet_min_tail_msgs = args.qnet_min_tail_msgs
+    if qnet is not None:
+        qnet._qnet_max_prompt_tokens = args.qnet_max_prompt_tokens
+        qnet._qnet_keep_first_n = args.qnet_keep_first_n
+        qnet._qnet_min_tail_msgs = args.qnet_min_tail_msgs
         
     env_config = exp_config["env_config"]
     logger.info(f"Experiment config: \n{json.dumps(exp_config, indent=2)}")
@@ -1100,18 +1450,25 @@ def main(args):
                             q_score = None
                             selection_score_raw = float(env_reward)
                         else:
-                            q_score = float(
-                                evaluate_trajs_qnet_v2(
-                                    qnet,
-                                    tokenizer,
-                                    new_state,
-                                    batch_size=1,
-                                    disable_tqdm=True,
-                                    model_name=args.model_name,
-                                    debug=args.debug,
-                                )[0]
-                            )
-                            selection_score_raw = q_score
+                            if qnet is not None:
+                                q_score = float(
+                                    evaluate_trajs_qnet_v2(
+                                        qnet,
+                                        tokenizer,
+                                        new_state,
+                                        batch_size=1,
+                                        disable_tqdm=True,
+                                        model_name=args.model_name,
+                                        debug=args.debug,
+                                    )[0]
+                                )
+                                selection_score_raw = q_score
+                            else:
+                                # New DuelingQNet strategies score candidates before transition using A(s,a)
+                                # We still env.step all candidates here to keep selected new_state
+                                # available and to log terminal rewards, but we do not evaluate old QNet.
+                                q_score = None
+                                selection_score_raw = 0.0
 
                         parsed_action = cand_item.get("parsed_action")
                         if parsed_action is None:
@@ -1141,6 +1498,12 @@ def main(args):
                             "q_std": None,
                             "q_advantage": None,
                             "corrected_score": None,
+                            "dueling_value": None,
+                            "dueling_advantage_raw": None,
+                            "dueling_advantage_centered": None,
+                            "dueling_advantage_norm": None,
+                            "dueling_adv_mean": None,
+                            "dueling_adv_std": None,
                             "selected": False,
                             "selected_by_raw_q": False,
                             "selected_by_final_policy": False,
@@ -1170,6 +1533,12 @@ def main(args):
                                 "q_std": None,
                                 "q_advantage": None,
                                 "corrected_score": None,
+                                "dueling_value": None,
+                                "dueling_advantage_raw": None,
+                                "dueling_advantage_centered": None,
+                                "dueling_advantage_norm": None,
+                                "dueling_adv_mean": None,
+                                "dueling_adv_std": None,
                                 "selected": False,
                                 "selected_by_raw_q": False,
                                 "selected_by_final_policy": False,
@@ -1194,9 +1563,23 @@ def main(args):
                     # ------------------------------------------------------------------
                     # Compute corrected scores and select candidate.
                     # ------------------------------------------------------------------
-                    if is_q_adv_logit_strategy(args):
+                    if is_dueling_adv_logit_strategy(args):
+                        if dueling_qnet is None or dueling_tokenizer is None:
+                            raise RuntimeError("Dueling strategy selected, but dueling_qnet/tokenizer is not loaded.")
+
+                        evaluate_candidates_dueling_qnet(
+                            model=dueling_qnet,
+                            tokenizer=dueling_tokenizer,
+                            state_history=cur_traj_state.history,
+                            candidate_records=candidate_records,
+                            args=args,
+                        )
+                        selected_candidate = select_candidate_q_adv_logit(candidate_records, args)
+
+                    elif is_q_adv_logit_strategy(args):
                         compute_q_advantage_and_corrected_scores(candidate_records, args)
                         selected_candidate = select_candidate_q_adv_logit(candidate_records, args)
+
                     else:
                         selected_candidate = select_candidate_raw_q_argmax(candidate_records, args)
 
@@ -1212,7 +1595,7 @@ def main(args):
                     selection_diagnostics["traj_id"] = traj_id
                     step_selection_diagnostics_list.append(selection_diagnostics)
 
-                    if selection_diagnostics["is_q_adv_logit_strategy"]:
+                    if selection_diagnostics["is_corrected_logit_strategy"]:
                         traj_correction_stats["num_q_adv_steps"] += 1
                         global_correction_stats["num_q_adv_steps"] += 1
 
@@ -1238,9 +1621,14 @@ def main(args):
 
                     new_state = selected_candidate["new_state"]
 
-                    # Keep TreeNode.q_value compatible with original QLASS:
-                    # store raw QNet/env score, not corrected_score.
-                    chosen_score = selected_candidate["selection_score_raw"]
+                    # For legacy QLASS strategies, TreeNode.q_value stores the raw QNet/env score.
+                    # For DuelingQNet strategies, there is no legacy QNet score, so store the
+                    # actual critic-based score used for selection. This does not affect env rollout;
+                    # it only makes tree logs/statistics meaningful.
+                    if is_dueling_adv_logit_strategy(args):
+                        chosen_score = float(selected_candidate["corrected_score"])
+                    else:
+                        chosen_score = float(selected_candidate["selection_score_raw"])
 
                     logger.info(
                         "[SELECT_FINAL] task=%s traj=%d turn=%d strategy=%s "
@@ -1484,6 +1872,74 @@ if __name__ == "__main__":
         help="Path to the QNet model.",
     )
     parser.add_argument(
+    "--dueling_qnet_path",
+    type=str,
+    default=None,
+    help=(
+        "Path to a loadable DuelingQNet checkpoint. Required for "
+        "dueling_adv_logit_* strategies unless --qnet_path points to the dueling checkpoint."
+    ),
+    )
+    parser.add_argument(
+        "--dueling_tokenizer_path",
+        type=str,
+        default=None,
+        help=(
+            "Tokenizer path for DuelingQNet. Defaults to --dueling_qnet_path. "
+            "The exported dueling checkpoint should contain tokenizer files."
+        ),
+    )
+    parser.add_argument(
+        "--dueling_prompt_model_name",
+        type=str,
+        default=None,
+        help=(
+            "Model name/path used only to choose the chat template for DuelingQNet prompts. "
+            "Defaults to --model_name. For maximum consistency, pass the SFT model path used during dueling training."
+        ),
+    )
+    parser.add_argument(
+        "--dueling_model_max_length",
+        type=int,
+        default=4096,
+        help="Maximum tokenized length for DuelingQNet value/advantage prompts.",
+    )
+    parser.add_argument(
+        "--dueling_pad_to_max_length",
+        action="store_true",
+        help="Pad DuelingQNet prompts to dueling_model_max_length.",
+    )
+    parser.add_argument(
+        "--dueling_truncation_side",
+        type=str,
+        default="left",
+        choices=["left", "right"],
+        help=(
+            "Tokenizer truncation side for DuelingQNet inference. "
+            "Default left keeps the recent observation and candidate action."
+        ),
+    )
+    parser.add_argument(
+        "--dueling_advantage_norm",
+        type=str,
+        default="zscore",
+        choices=["zscore", "centered", "none"],
+        help=(
+            "How to normalize DuelingQNet advantages before mixing with actor logprob. "
+            "zscore is recommended; centered is an ablation; none uses raw A(s,a)."
+        ),
+    )
+    parser.add_argument(
+        "--dueling_bf16",
+        action="store_true",
+        help="Load DuelingQNet in bf16.",
+    )
+    parser.add_argument(
+        "--dueling_fp16",
+        action="store_true",
+        help="Load DuelingQNet in fp16.",
+    )
+    parser.add_argument(
         "--sample_mode",
         type=str,
         default='epsilon_greedy',
@@ -1494,7 +1950,14 @@ if __name__ == "__main__":
         "--selection_strategy",
         type=str,
         default="q_argmax",
-        choices=["q_argmax", "q_argmax_oversample", "q_adv_logit_argmax", "q_adv_logit_sample"],
+        choices=[
+            "q_argmax",
+            "q_argmax_oversample",
+            "q_adv_logit_argmax",
+            "q_adv_logit_sample",
+            "dueling_adv_logit_argmax",
+            "dueling_adv_logit_sample",
+        ],
         help=(
             "Final candidate selection strategy. "
             "q_argmax keeps the original QLASS raw-Q selection. "
@@ -1612,6 +2075,15 @@ if __name__ == "__main__":
         raise ValueError(
             "--q_adv_sample_temperature must be positive, got {args.q_adv_sample_temperature}"
         )
+
+    if args.dueling_bf16 and args.dueling_fp16:
+        raise ValueError("Use only one of --dueling_bf16 or --dueling_fp16.")
+
+    if is_dueling_adv_logit_strategy(args):
+        if args.actor_logprob_type != "mean":
+            logger.warning(
+                "[q_guided_inference] dueling_adv_logit usually works best with --actor_logprob_type mean because action lengths can differ."
+            )
 
     if args.verbose:
         logger.setLevel(logging.INFO)

@@ -311,20 +311,24 @@ class DuelingQNet(nn.Module):
             adv_attention_mask=adv_attention_mask,
         )
 
-        # [1, 1] -> scalar; [K, 1] -> [K]
-        value = self.value_head(value_pooled).view(-1)[0]
-        advantages = self.advantage_head(adv_pooled).view(-1)
+        # Raw head outputs may be bf16/fp16 because the backbone and heads are loaded in bf16.
+        value_raw = self.value_head(value_pooled).view(-1)[0]  # scalar
+        advantages_raw = self.advantage_head(adv_pooled).view(-1)  # [K]
 
-        advantage_mean = self._masked_mean(advantages, candidate_mask)
-        centered_advantages = advantages - advantage_mean
-        q_values = value + centered_advantages
+        # Important: do all dueling arithmetic in fp32.
+        # Otherwise small centered advantages can be lost when added to V(s).
+        value_fp32 = value_raw.float()
+        advantages_fp32 = advantages_raw.float()
 
-        # Cast predictions used in loss/logging to fp32 for numerical stability.
-        value_fp32 = value.float()
-        advantages_fp32 = advantages.float()
-        advantage_mean_fp32 = advantage_mean.float()
-        centered_advantages_fp32 = centered_advantages.float()
-        q_values_fp32 = q_values.float()
+        mask_f = candidate_mask.to(
+            device=advantages_fp32.device,
+            dtype=advantages_fp32.dtype,
+        )
+        denom = mask_f.sum().clamp_min(1.0)
+
+        advantage_mean_fp32 = (advantages_fp32 * mask_f).sum() / denom
+        centered_advantages_fp32 = advantages_fp32 - advantage_mean_fp32
+        q_values_fp32 = value_fp32 + centered_advantages_fp32
 
         output = DuelingQNetOutput(
             value=value_fp32,                              # scalar tensor
@@ -340,13 +344,10 @@ class DuelingQNet(nn.Module):
                 raise ValueError(
                     f"candidate_targets length {targets.numel()} != q_values length {q_values_fp32.numel()}"
                 )
-            mask_f = candidate_mask.to(device=q_values_fp32.device, dtype=torch.float32)
-            denom = mask_f.sum().clamp_min(1.0)
 
             q_loss = (((q_values_fp32 - targets) ** 2) * mask_f).sum() / denom
 
-            # Since mean_i Q_i = V(s) under candidate-normalized dueling, the
-            # natural auxiliary value target is mean_i target_i for this group.
+            # Since mean_i Q_i = V(s), a natural auxiliary value target is mean_i target_i.
             value_target = (targets * mask_f).sum() / denom
             value_loss = F.mse_loss(value_fp32, value_target.detach())
             loss = q_loss + self.value_loss_coef * value_loss
