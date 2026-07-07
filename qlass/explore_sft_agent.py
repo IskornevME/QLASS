@@ -142,6 +142,45 @@ def collect_and_print_stats(node):
 
 MAX_TURNS={"webshop":5,"sciworld":18,"alfworld":18}
 
+
+def normalize_action_text(action) -> str:
+    """Normalize action text for duplicate filtering during exploration.
+
+    Returns empty string for empty/malformed model outputs.
+    """
+    if action is None:
+        return ""
+
+    if isinstance(action, dict):
+        action = action.get("value", "")
+
+    text = str(action).strip()
+    if not text:
+        return ""
+
+    # Keep the actual action line if the model outputs Thought + Action.
+    # Use case-insensitive search without adding a new dependency.
+    lower_text = text.lower()
+    marker = "action:"
+    pos = lower_text.rfind(marker)
+    if pos >= 0:
+        text = text[pos + len(marker):].strip()
+
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if not lines:
+        return ""
+
+    text = lines[0].strip().rstrip(".")
+    return " ".join(text.lower().split())
+
+
+def action_to_prompt_text(action) -> str:
+    """Convert stored TreeNode action to readable text for diversity prompts."""
+    if isinstance(action, dict):
+        action = action.get("value", "")
+    return str(action).strip()
+
+
 def main(args):
 
     with open(os.path.join(args.exp_path, f"{args.exp_config}.json")) as f:
@@ -285,19 +324,54 @@ def main(args):
             n_success = 0
             n_traj = 0
 
+            expanded_nodes = 0
             while not node_queue.empty():
+                if (
+                    args.max_expanded_nodes_per_task is not None
+                    and expanded_nodes >= args.max_expanded_nodes_per_task
+                ):
+                    logger.warning(
+                        "[MAX_EXPANDED_NODES] task=%s reached cap=%d. "
+                        "Stopping BFS expansion for this task.",
+                        id,
+                        args.max_expanded_nodes_per_task,
+                    )
+                    break
+
+                expanded_nodes += 1
                 node = node_queue.get()
                 depth = depth_queue.get()
 
                 if depth > args.max_depth:
-                    explore_samples = 1
-                else:
-                    explore_samples = args.samples_per_depth
+                    continue
+                explore_samples = args.samples_per_depth
                 
                 new_action_list = [child.action for child in node.children]
+                seen_action_keys = {normalize_action_text(action) for action in new_action_list}
 
-                # Expand child action to samples_per_depth
-                for _ in range(len(new_action_list), explore_samples):
+                max_attempts = (
+                    args.max_child_sample_attempts
+                    if args.max_child_sample_attempts is not None
+                    else max(2 * explore_samples, explore_samples + 2)
+                )
+                if args.progress_log_every > 0 and expanded_nodes % args.progress_log_every == 0:
+                    logger.warning(
+                        "[EXPLORE_PROGRESS] task=%s expanded_nodes=%d queue_size=%d depth=%d "
+                        "samples_per_depth=%d max_attempts=%d",
+                        id,
+                        expanded_nodes,
+                        node_queue.qsize(),
+                        depth,
+                        explore_samples if "explore_samples" in locals() else -1,
+                        max_attempts if "max_attempts" in locals() else -1,
+                    )
+
+                num_attempts = 0
+                enqueued_children_for_node = 0
+
+                # Try to obtain up to explore_samples unique children for this node.
+                while len(seen_action_keys) < explore_samples and num_attempts < max_attempts:
+                    num_attempts += 1
                     # observation, state = env.reset(args.num_icl_examples)
                     # cur_step = 1
                     # # Get the corresponding state of the current node
@@ -334,13 +408,18 @@ def main(args):
                     else:
                         # Make sure the agent does not repeat the already explored action
                         if len(new_action_list) == 1:
-                            explore_add_prompt = f"\nPlease provide another reasonable response different from '{new_action_list[0]}'."
+                            explore_add_prompt = (
+                                "\nPlease provide another reasonable response different from "
+                                f"'{action_to_prompt_text(new_action_list[0])}'."
+                            )
                             if args.exp_config=='webshop':
                                 explore_add_prompt +=  "If the previous action was a search, your new action should be searching for different content. If it was a click, your new action should be clicking on a different item."
                         else:
                             explore_add_prompt =f"\nYou have given the the following answers. \n"
-                            for i in range(len(new_action_list)):
-                                explore_add_prompt += f"Answer {i+1}: '{new_action_list[i]}'\n"
+                            for prev_i, prev_action in enumerate(new_action_list):
+                                explore_add_prompt += (
+                                    f"Answer {prev_i + 1}: '{action_to_prompt_text(prev_action)}'\n"
+                                )
                             explore_add_prompt += "Please provide a reasonable response different from previous answers."
                             if args.exp_config=='webshop':
                                 explore_add_prompt += "If the previous actions were 'search', your new action should be searching for different content. If previous actions were 'click', your new action should be clicking on a different item."
@@ -349,14 +428,17 @@ def main(args):
                         input[-1]['content'] += explore_add_prompt
                         
                     action = agent(input)
+                    action_key = normalize_action_text(action)
 
+                    if not action_key:
+                        continue
+
+                    if action_key in seen_action_keys:
+                        continue
+
+                    seen_action_keys.add(action_key)
                     new_action_list.append(action)
 
-                    # Check if the action is the same as the previous action, if so, skip it from expansion
-                    # In this case, the number child node might not be the same as the samples_per_depth
-                    if len(new_action_list) > 1 and new_action_list[-1] == new_action_list[-2]:
-                        continue
-                    
                     _, new_state = env.step(action)
                     # cur_state = new_state.to_dict()['conversations']
                     try:
@@ -370,41 +452,93 @@ def main(args):
                     assert isinstance(cur_state[-2],dict) and cur_state[-2]['from']=='gpt'
                     node.add_child(new_node)
 
-                    if not new_state.finished :
+                    if not new_state.finished:
                         new_depth = depth + 1
-                        node_queue.put(new_node)
-                        depth_queue.put(new_depth)
+
+                        # Important: collect up to samples_per_depth children, but do not recursively
+                        # expand all of them. Otherwise samples_per_depth becomes the tree branching
+                        # factor and the search explodes.
+                        if (
+                            new_depth <= args.max_depth
+                            and enqueued_children_for_node < args.max_enqueued_children_per_node
+                        ):
+                            node_queue.put(new_node)
+                            depth_queue.put(new_depth)
+                            enqueued_children_for_node += 1
+
                         # Roll out the trajectory
                         current_node = new_node
                         current_depth = new_depth + 1
                         initial_new_node = new_node
-                        while not new_state.finished:
+
+                        rollout_steps = 0
+                        max_rollout_steps = min(args.max_rollout_steps, MAX_TURNS[args.exp_config])
+
+                        while not new_state.finished and rollout_steps < max_rollout_steps:
+                            rollout_steps += 1
+
                             action = agent(new_state.history)
+                            action_key = normalize_action_text(action)
+
+                            if not action_key:
+                                logger.warning(
+                                    "[EMPTY_ACTION_ROLLOUT] task=%s depth=%s rollout_step=%s. "
+                                    "Stopping this rollout branch.",
+                                    id,
+                                    depth,
+                                    rollout_steps,
+                                )
+                                break
+
                             _, new_state = env.step(action)
-                            # current_depth +=1
-                            new_node = TreeNode(state=new_state.to_dict()['conversations'][:-2], action=new_state.to_dict()['conversations'][-2], reward=new_state.reward)
-                            assert isinstance(new_state.to_dict()['conversations'][-2],dict) and new_state.to_dict()['conversations'][-2]['from']=='gpt'
+
+                            new_node = TreeNode(
+                                state=new_state.to_dict()['conversations'][:-2],
+                                action=new_state.to_dict()['conversations'][-2],
+                                reward=new_state.reward,
+                            )
+                            assert isinstance(new_state.to_dict()['conversations'][-2], dict)
+                            assert new_state.to_dict()['conversations'][-2]['from'] == 'gpt'
+
                             current_node.add_child(new_node)
                             current_node = new_node
+
                             if new_state.finished:
                                 all_trajs.append(
-                                {
-                                    'dataset': ds,
-                                    'id': id,
-                                    'conversations': new_state.to_dict()['conversations'],
-                                    'reward': new_state.reward,
-                                    'success': new_state.success,
-                                })
+                                    {
+                                        'dataset': ds,
+                                        'id': id,
+                                        'conversations': new_state.to_dict()['conversations'],
+                                        'reward': new_state.reward,
+                                        'success': new_state.success,
+                                    }
+                                )
                                 n_traj += 1
                                 n_success += 1 if new_state.reward == 1.0 else 0
+
+                        if len(initial_new_node.children) == 0:
+                            continue
+
+
                         added_node = initial_new_node.children[0]
 
-                        if new_state.reward > 0.01 and current_depth <= args.max_depth and current_depth > args.min_prune_depth: # prune the branches that lead to low reward
+                        # Only use terminal successful rollouts for pruning/queueing the rollout path.
+                        # Rollout can now stop by max_rollout_steps or empty action, in which case
+                        # reward may be None and should not be used as a successful rollout signal.
+                        terminal_reward = 0.0 if new_state.reward is None else float(new_state.reward)
+
+                        if (
+                            new_state.finished
+                            and terminal_reward > 0.01
+                            and current_depth <= args.max_depth
+                            and current_depth > args.min_prune_depth
+                        ):
                             while current_depth <= args.max_depth and len(added_node.children) > 0:
                                 node_queue.put(added_node)
                                 depth_queue.put(current_depth)
                                 current_depth += 1
                                 added_node = added_node.children[0]
+
                     else:
                         all_trajs.append(
                             {
@@ -448,30 +582,72 @@ def main(args):
                         continue
 
                     brother_action = agent(bro_state.history)
+                    brother_action_key = normalize_action_text(brother_action)
+
+                    if not brother_action_key:
+                        logger.warning(
+                            "[EMPTY_ACTION_BROTHER_ROOT] task=%s i=%s. Skipping brother branch.",
+                            id,
+                            i,
+                        )
+                        continue
+
                     _, bro_state = env.step(brother_action)
-                    brother_root_node = TreeNode(state=bro_state.to_dict()['conversations'][:-2], action=bro_state.to_dict()['conversations'][-2],reward=bro_state.reward)
-                    assert isinstance(bro_state.to_dict()['conversations'][-2],dict)and bro_state.to_dict()['conversations'][-2]['from']=='gpt' 
+
+                    brother_root_node = TreeNode(
+                        state=bro_state.to_dict()['conversations'][:-2],
+                        action=bro_state.to_dict()['conversations'][-2],
+                        reward=bro_state.reward,
+                    )
+                    assert isinstance(bro_state.to_dict()['conversations'][-2], dict)
+                    assert bro_state.to_dict()['conversations'][-2]['from'] == 'gpt'
+
                     brother_current_node = brother_root_node
 
-                    while not bro_state.finished:
+                    bro_rollout_steps = 0
+                    max_bro_rollout_steps = min(args.max_rollout_steps, MAX_TURNS[args.exp_config])
+
+                    while not bro_state.finished and bro_rollout_steps < max_bro_rollout_steps:
+                        bro_rollout_steps += 1
+
                         brother_action = agent(bro_state.history)
-                        _,bro_state = env.step(brother_action)
-                        brother_new_node = TreeNode(state=bro_state.to_dict()['conversations'][:-2], action=bro_state.to_dict()['conversations'][-2], reward=bro_state.reward)
-                        assert isinstance(bro_state.to_dict()['conversations'][-2], dict) and bro_state.to_dict()['conversations'][-2]['from']=='gpt' 
+                        brother_action_key = normalize_action_text(brother_action)
+
+                        if not brother_action_key:
+                            logger.warning(
+                                "[EMPTY_ACTION_BROTHER_ROLLOUT] task=%s i=%s rollout_step=%s. "
+                                "Stopping brother rollout.",
+                                id,
+                                i,
+                                bro_rollout_steps,
+                            )
+                            break
+
+                        _, bro_state = env.step(brother_action)
+
+                        brother_new_node = TreeNode(
+                            state=bro_state.to_dict()['conversations'][:-2],
+                            action=bro_state.to_dict()['conversations'][-2],
+                            reward=bro_state.reward,
+                        )
+                        assert isinstance(bro_state.to_dict()['conversations'][-2], dict)
+                        assert bro_state.to_dict()['conversations'][-2]['from'] == 'gpt'
+
                         brother_current_node.add_child(brother_new_node)
                         brother_current_node = brother_new_node
 
-                    all_trajs.append(
-                        {
-                            'dataset': ds,
-                            'id': id,
-                            'conversations': bro_state.to_dict()['conversations'],
-                            'reward': bro_state.reward,
-                            'success': bro_state.success,
-                        }
-                    )
-                    n_traj += 1
-                    n_success += 1 if bro_state.reward == 1 else 0
+                    if bro_state.finished:
+                        all_trajs.append(
+                            {
+                                'dataset': ds,
+                                'id': id,
+                                'conversations': bro_state.to_dict()['conversations'],
+                                'reward': bro_state.reward,
+                                'success': bro_state.success,
+                            }
+                        )
+                        n_traj += 1
+                        n_success += 1 if bro_state.reward == 1 else 0
                     current_node.add_child(brother_root_node)
                     
                 current_node.add_child(new_node)
@@ -567,6 +743,15 @@ if __name__ == "__main__":
         help="Num of explored tree nodes at each depth.",
     )
     parser.add_argument(
+        "--max_child_sample_attempts",
+        type=int,
+        default=None,
+        help=(
+            "Maximum generation attempts per node to obtain samples_per_depth unique children. "
+            "Default: max(2 * samples_per_depth, samples_per_depth + 2)."
+        ),
+    )
+    parser.add_argument(
         "--recursive",
         action="store_true",
         help="Whether to run in debug mode (10 ex per task).",
@@ -628,8 +813,60 @@ if __name__ == "__main__":
         default="data/train/explore/",
         help='The path to save the generated trajectories and trees.'
     )
-        
+    parser.add_argument(
+        "--max_expanded_nodes_per_task",
+        type=int,
+        default=None,
+        help=(
+            "Optional hard cap on BFS-expanded nodes per task. "
+            "Useful to avoid extremely expensive tasks when samples_per_depth is large."
+        ),
+    )
+    parser.add_argument(
+        "--max_enqueued_children_per_node",
+        type=int,
+        default=1,
+        help=(
+            "How many non-terminal generated children per expanded node should be "
+            "put into BFS queue for further expansion. This decouples candidate fanout "
+            "from recursive tree branching."
+        ),
+    )
+    parser.add_argument(
+        "--max_rollout_steps",
+        type=int,
+        default=8,
+        help="Maximum number of policy actions in each rollout after a generated child.",
+    )
+    parser.add_argument(
+        "--progress_log_every",
+        type=int,
+        default=50,
+        help="Log BFS exploration progress every N expanded nodes.",
+    )
+
     args = parser.parse_args()
+    if args.samples_per_depth <= 0:
+        raise ValueError(f"--samples_per_depth must be positive, got {args.samples_per_depth}")
+
+    if args.max_child_sample_attempts is not None and args.max_child_sample_attempts < args.samples_per_depth:
+        raise ValueError(
+            "--max_child_sample_attempts must be >= --samples_per_depth, got "
+            f"{args.max_child_sample_attempts} < {args.samples_per_depth}"
+        )
+    if args.max_expanded_nodes_per_task is not None and args.max_expanded_nodes_per_task <= 0:
+        raise ValueError(
+            "--max_expanded_nodes_per_task must be positive when set, got "
+            f"{args.max_expanded_nodes_per_task}"
+        )
+    if args.max_enqueued_children_per_node <= 0:
+        raise ValueError(
+            "--max_enqueued_children_per_node must be positive, got "
+            f"{args.max_enqueued_children_per_node}"
+        )
+    if args.max_rollout_steps <= 0:
+        raise ValueError(f"--max_rollout_steps must be positive, got {args.max_rollout_steps}")
+
     if args.verbose:
         logger.setLevel(logging.INFO)
     elif args.debug:
