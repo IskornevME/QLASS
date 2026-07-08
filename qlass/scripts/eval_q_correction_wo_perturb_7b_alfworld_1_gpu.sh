@@ -91,7 +91,6 @@ if [[ "${PREFER_TERMINAL_SUCCESS}" == "1" ]]; then
   SELECTION_ARGS+=(--prefer_terminal_success)
 fi
 
-echo "[CONFIG] Repository root: ${REPO_ROOT}"
 echo "[CONFIG] SFT model:       ${SFT_MODEL_PATH}"
 echo "[CONFIG] QNet model:      ${QNET_PATH}"
 echo "[CONFIG] GPUs:            server=${SERVER_GPU}, qnet_worker=${WORKER_GPU}"
@@ -142,7 +141,7 @@ CUDA_VISIBLE_DEVICES="${WORKER_GPU}" python qlass/q_guided_inference.py \
   --exp_name "${EXP_NAME}" \
   --exp_path qlass/configs/task/ \
   --exp_config "${TASK}" \
-  --split "${SPLT}" \
+  --split "${SPLIT}" \
   --slice_num "${SLICE_NUM}" \
   --slice_id "${SLICE_ID}" \
   --model_name "${SFT_MODEL_NAME}" \

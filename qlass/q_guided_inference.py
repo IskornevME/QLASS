@@ -575,6 +575,12 @@ def main(args):
     done_task_id = []
     mult_success_num = 0
     num_first_success = 0
+    memory_run_stats = {
+        "decision_steps": 0,
+        "steps_with_nonzero_correction": 0,
+        "argmax_changed_by_correction": 0,
+        "actual_selection_changed_by_memory": 0,
+    }
     with logging_redirect_tqdm():
         pbar = tqdm(total=n_tasks)
         for i, task in enumerate(all_tasks):
@@ -624,6 +630,12 @@ def main(args):
             with open(instruction_path) as f:
                 instruction = f.read()
             num_success = 0
+            task_memory_stats = {
+                "decision_steps": 0,
+                "steps_with_nonzero_correction": 0,
+                "argmax_changed_by_correction": 0,
+                "actual_selection_changed_by_memory": 0,
+            }
             for traj_id in range(args.n_trajs):
                 init_msg, cur_traj_state = env.reset(
                     num_icl_examples=args.num_icl_examples
@@ -640,6 +652,7 @@ def main(args):
                 executed_steps: List[Dict[str, Any]] = []
                 action_value_list = []
                 steps_with_nonzero_correction = 0
+                argmax_changed_by_correction = 0
                 decisions_changed_by_memory = 0
 
                 for n_turn in range(env.max_steps):
@@ -895,7 +908,34 @@ def main(args):
                         abs(record["memory_correction"]) > 1e-12
                         for record in candidate_records
                     )
+
+                    if correction_memory is not None:
+                        memory_run_stats["decision_steps"] += 1
+                        task_memory_stats["decision_steps"] += 1
+
+                        memory_run_stats["steps_with_nonzero_correction"] += int(
+                            has_nonzero_correction
+                        )
+                        task_memory_stats["steps_with_nonzero_correction"] += int(
+                            has_nonzero_correction
+                        )
+
+                        memory_run_stats["argmax_changed_by_correction"] += int(
+                            ranking_changed_by_memory
+                        )
+                        task_memory_stats["argmax_changed_by_correction"] += int(
+                            ranking_changed_by_memory
+                        )
+
+                        memory_run_stats["actual_selection_changed_by_memory"] += int(
+                            selection_changed_by_memory
+                        )
+                        task_memory_stats["actual_selection_changed_by_memory"] += int(
+                            selection_changed_by_memory
+                        )
+
                     steps_with_nonzero_correction += int(has_nonzero_correction)
+                    argmax_changed_by_correction += int(ranking_changed_by_memory)
                     decisions_changed_by_memory += int(selection_changed_by_memory)
 
                     selected_record = candidate_records[selected_idx]
@@ -1044,6 +1084,7 @@ def main(args):
                         episode_metadata={
                             "task_index": i,
                             "steps_with_nonzero_correction": steps_with_nonzero_correction,
+                            "argmax_changed_by_correction": argmax_changed_by_correction,
                             "decisions_changed_by_memory": decisions_changed_by_memory,
                         },
                     )
@@ -1058,6 +1099,7 @@ def main(args):
                             "success": bool(cur_traj_state.success),
                             "final_reward": float(cur_traj_state.reward),
                             "steps_with_nonzero_correction": steps_with_nonzero_correction,
+                            "argmax_changed_by_correction": argmax_changed_by_correction,
                             "decisions_changed_by_memory": decisions_changed_by_memory,
                             "memory_update": memory_update,
                             "memory_stats_after": correction_memory.stats(),
@@ -1075,6 +1117,7 @@ def main(args):
                 if correction_memory is not None:
                     trajectory_record["memory_correction_summary"] = {
                         "steps_with_nonzero_correction": steps_with_nonzero_correction,
+                        "argmax_changed_by_correction": argmax_changed_by_correction,
                         "decisions_changed_by_memory": decisions_changed_by_memory,
                         "memory_update": memory_update,
                     }
@@ -1088,6 +1131,33 @@ def main(args):
 
             if num_success > 1:
                 mult_success_num += 1
+
+            if correction_memory is not None:
+                decision_steps = task_memory_stats["decision_steps"]
+                argmax_change_rate = (
+                    task_memory_stats["argmax_changed_by_correction"] / decision_steps
+                    if decision_steps > 0
+                    else 0.0
+                )
+                actual_change_rate = (
+                    task_memory_stats["actual_selection_changed_by_memory"] / decision_steps
+                    if decision_steps > 0
+                    else 0.0
+                )
+
+                _append_jsonl_record(
+                    memory_log_file,
+                    {
+                        "record_type": "task_summary",
+                        "task_index": i,
+                        "task_id": task.task_id,
+                        "num_attempts": args.n_trajs,
+                        "num_success": num_success,
+                        "memory_stats": task_memory_stats,
+                        "argmax_change_rate": argmax_change_rate,
+                        "actual_selection_change_rate": actual_change_rate,
+                    },
+                )
 
             collect_and_print_stats(root)
             # max_reward_traj = max(all_trajs, key=lambda traj: traj['reward'])
@@ -1121,6 +1191,44 @@ def main(args):
     print(f"Finally, The Number of Successful Trajectories with multi evaluation: {mult_success_num} / {n_tasks} ")
     print(f"Finally, The Number of Successful Trajectories with first inference: {num_first_success} / {n_tasks} ")
     print(f"Average Reward: {sum(rewards) / n_traj}")
+    if correction_memory is not None:
+        decision_steps = memory_run_stats["decision_steps"]
+        argmax_change_rate = (
+            memory_run_stats["argmax_changed_by_correction"] / decision_steps
+            if decision_steps > 0
+            else 0.0
+        )
+        actual_change_rate = (
+            memory_run_stats["actual_selection_changed_by_memory"] / decision_steps
+            if decision_steps > 0
+            else 0.0
+        )
+
+        print(
+            "[MEMORY_SUMMARY] "
+            f"argmax_changed_by_correction="
+            f"{memory_run_stats['argmax_changed_by_correction']} / {decision_steps} "
+            f"({argmax_change_rate:.4f}); "
+            f"actual_selection_changed_by_memory="
+            f"{memory_run_stats['actual_selection_changed_by_memory']} / {decision_steps} "
+            f"({actual_change_rate:.4f}); "
+            f"steps_with_nonzero_correction="
+            f"{memory_run_stats['steps_with_nonzero_correction']} / {decision_steps}"
+        )
+
+        _append_jsonl_record(
+            memory_log_file,
+            {
+                "record_type": "run_summary",
+                "num_trajectories": n_traj,
+                "num_success": n_success,
+                "average_reward": sum(rewards) / n_traj if n_traj > 0 else 0.0,
+                "memory_stats": memory_run_stats,
+                "argmax_change_rate": argmax_change_rate,
+                "actual_selection_change_rate": actual_change_rate,
+                "final_memory_stats": correction_memory.stats(),
+            },
+        )
     if args.debug:
         traj_file = f'{root_dir}/data/train/explore/debug2.jsonl'
         tree_file = f'{root_dir}/data/train/explore/debug2.pkl'

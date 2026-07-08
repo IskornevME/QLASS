@@ -9,6 +9,6 @@
         "num_samples": 1,
         "max_prompt_tokens": 3800,
         "keep_first_n": 3,
-        "tokenizer_path": "/home/m.iskornev/qlass/models/qlass-Llama-2-7b-chat-hf-sciworld-sft_run1"
+        "tokenizer_path": "/home/m.iskornev/qlass/models/qlass-Llama-2-7b-chat-hf-alfworld-sft_run1"
     }
 }
