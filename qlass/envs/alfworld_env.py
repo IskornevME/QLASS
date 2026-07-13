@@ -32,6 +32,7 @@ class AlfWorldEnv(BaseEnv):
         # self.env = task.env
         self.env = self._load_single_task_env(self.task.game_file)
         self.state = State()
+        self.current_admissible_commands = []
     
     def _load_single_task_env(self, gamefile: str):
         alfworld_data_path = "eval_agent/data/alfworld"
@@ -67,18 +68,27 @@ class AlfWorldEnv(BaseEnv):
         env = textworld.gym.make(env_id)
         return env
 
+    def get_admissible_commands(self):
+        """Return admissible ALFWorld commands for the current environment state."""
+        return list(getattr(self, "current_admissible_commands", []) or [])
+
     def parse_action(self, llm_output: str) -> str:
         llm_output = llm_output.strip()
         pattern = re.compile(r"Action:\s?(.*)", re.DOTALL)
         action = re.findall(pattern, llm_output)[0]
         assert action is not None
         return action
-    
+
     def conduct_action(self, action: str):
         observation, reward, done, info = self.env.step([action])
-        observation, reward, done = process_ob(observation[0]), info['won'][0], done[0]
+
+        self.current_admissible_commands = list(
+            (info.get("admissible_commands") or [[]])[0]
+        )
+
+        observation, reward, done = process_ob(observation[0]), info["won"][0], done[0]
         return observation, reward, done
-    
+
     def step(self, llm_output: str) -> Tuple[str, State]:
         # import pdb; pdb.set_trace()
         self.state.history.append({
@@ -144,5 +154,12 @@ class AlfWorldEnv(BaseEnv):
             })
         elif self.icl_format == 'conversation':
             self.state.history = messages
-        self.env.reset()
+        try:
+            _, info = self.env.reset()
+            self.current_admissible_commands = list(
+                (info.get("admissible_commands") or [[]])[0]
+            )
+        except Exception:
+            self.current_admissible_commands = []
+
         return observation, self.state

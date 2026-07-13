@@ -55,7 +55,19 @@ else
   TERMINAL_TAG="no_terminal_override"
 fi
 
-RUN_TAG="${DATA_PREFIX}_bon${BON}_${SPLIT}_run_${RUN_ID}_lambda${MEMORY_WEIGHT}_gamma${MEMORY_GAMMA}_k${MEMORY_TOP_K}_thr${MEMORY_THRESHOLD}_${MEMORY_SCOPE}_${TERMINAL_TAG}"
+ENABLE_MEMORY_ACTION_AUGMENTATION="${ENABLE_MEMORY_ACTION_AUGMENTATION:-0}"
+MEMORY_MAX_AUGMENTED_ACTIONS="${MEMORY_MAX_AUGMENTED_ACTIONS:-2}"
+MEMORY_AUG_MAX_PER_CANONICAL="${MEMORY_AUG_MAX_PER_CANONICAL:-1}"
+MEMORY_AUGMENTATION_MIN_MEAN_RETURN="${MEMORY_AUGMENTATION_MIN_MEAN_RETURN:-1e-12}"
+MEMORY_AUGMENTED_ACTION_FORMAT="${MEMORY_AUGMENTED_ACTION_FORMAT:-retrieved_thought_exact_only}"
+
+if [[ "${ENABLE_MEMORY_ACTION_AUGMENTATION}" == "1" ]]; then
+  AUG_TAG="aug${MEMORY_MAX_AUGMENTED_ACTIONS}_percanon${MEMORY_AUG_MAX_PER_CANONICAL}_${MEMORY_AUGMENTED_ACTION_FORMAT}"
+else
+  AUG_TAG="no_aug"
+fi
+
+RUN_TAG="${DATA_PREFIX}_bon${BON}_${SPLIT}_run_${RUN_ID}_lambda${MEMORY_WEIGHT}_gamma${MEMORY_GAMMA}_k${MEMORY_TOP_K}_thr${MEMORY_THRESHOLD}_${MEMORY_SCOPE}_${TERMINAL_TAG}_${AUG_TAG}"
 OUT_DIR="${OUT_DIR:-data/train/${TASK}/${SFT_MODEL_NAME}/q_correction_memory_without_perturb/${RUN_TAG}/}"
 MEMORY_DIR="${MEMORY_DIR:-${OUT_DIR}/memory}"
 MEMORY_LOG_FILE="${MEMORY_LOG_FILE:-${OUT_DIR}/${SLICE_ID}of${SLICE_NUM}_slices_bon_memory_correction_decisions.jsonl}"
@@ -86,6 +98,16 @@ if [[ "${DISABLE_DYNAMIC_THRESHOLD}" == "1" ]]; then
   MEMORY_ARGS+=(--memory_disable_dynamic_threshold)
 fi
 
+if [[ "${ENABLE_MEMORY_ACTION_AUGMENTATION}" == "1" ]]; then
+  MEMORY_ARGS+=(
+    --enable_memory_action_augmentation
+    --memory_max_augmented_actions "${MEMORY_MAX_AUGMENTED_ACTIONS}"
+    --memory_aug_max_per_canonical "${MEMORY_AUG_MAX_PER_CANONICAL}"
+    --memory_augmentation_min_mean_return "${MEMORY_AUGMENTATION_MIN_MEAN_RETURN}"
+    --memory_augmented_action_format "${MEMORY_AUGMENTED_ACTION_FORMAT}"
+  )
+fi
+
 SELECTION_ARGS=()
 if [[ "${PREFER_TERMINAL_SUCCESS}" == "1" ]]; then
   SELECTION_ARGS+=(--prefer_terminal_success)
@@ -100,6 +122,8 @@ echo "[CONFIG] Memory log:      ${MEMORY_LOG_FILE}"
 echo "[CONFIG] Correction:      lambda=${MEMORY_WEIGHT}, gamma=${MEMORY_GAMMA}, top_k=${MEMORY_TOP_K}, threshold=${MEMORY_THRESHOLD}"
 echo "[CONFIG] Memory scope:    ${MEMORY_SCOPE}; reset=${RESET_MEMORY}; dynamic_threshold_disabled=${DISABLE_DYNAMIC_THRESHOLD}"
 echo "[CONFIG] Terminal success override: ${PREFER_TERMINAL_SUCCESS}"
+echo "[CONFIG] Memory action augmentation: ${ENABLE_MEMORY_ACTION_AUGMENTATION}; max_aug=${MEMORY_MAX_AUGMENTED_ACTIONS}; max_per_canonical=${MEMORY_AUG_MAX_PER_CANONICAL}; min_return=${MEMORY_AUGMENTATION_MIN_MEAN_RETURN}"
+echo "[CONFIG] Memory augmented action format: ${MEMORY_AUGMENTED_ACTION_FORMAT}"
 
 # ---------------------------------------------------------------------------
 # Start the SFT policy server; clean it up when inference ends.

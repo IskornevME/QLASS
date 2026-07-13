@@ -383,6 +383,72 @@ def _extract_observation_for_memory(
     return str(task_text).strip()
 
 
+def _replace_action_line(raw_action: str, action_command: str) -> str:
+    """Replace the Action line in a retrieved ReAct output with the current command.
+
+    This is mainly a safety guard: in exact-match mode the command should
+    already be the same, but replacing the action line prevents accidental
+    execution of a stale object id if the stored raw action is imperfect.
+    """
+    text = str(raw_action or "").strip()
+    if not text:
+        return (
+            "Thought: I should take an action that has worked in a similar state.\n"
+            f"Action: {action_command}"
+        )
+
+    if re.search(r"Action:\s*.*", text, flags=re.IGNORECASE | re.DOTALL):
+        return re.sub(
+            r"Action:\s*.*",
+            f"Action: {action_command}",
+            text,
+            count=1,
+            flags=re.IGNORECASE | re.DOTALL,
+        ).strip()
+
+    return f"{text}\nAction: {action_command}".strip()
+
+
+def _build_memory_augmented_raw_action(
+    action_command: str,
+    *,
+    action_format: str,
+    retrieved_raw_action_exact: str = "",
+) -> str:
+    """Build assistant message for a memory-augmented ALFWorld command.
+
+    Modes:
+    - action_only:
+        no reasoning, only the current admissible command.
+    - generic_thought:
+        a short generic ReAct-style thought plus the current command.
+    - retrieved_thought_exact_only:
+        use retrieved reasoning only when there was an exact action match in memory; otherwise fall back to generic_thought.
+    """
+    action_command = str(action_command).strip()
+
+    if action_format == "action_only":
+        return f"Action: {action_command}"
+
+    if action_format == "generic_thought":
+        return (
+            "Thought: I should take an action that has worked in a similar state.\n"
+            f"Action: {action_command}"
+        )
+
+    if action_format == "retrieved_thought_exact_only":
+        if retrieved_raw_action_exact:
+            return _replace_action_line(
+                raw_action=retrieved_raw_action_exact,
+                action_command=action_command,
+            )
+        return (
+            "Thought: I should take an action that has worked in a similar state.\n"
+            f"Action: {action_command}"
+        )
+
+    raise ValueError(f"Unsupported memory_augmented_action_format: {action_format}")
+
 def _parse_action_for_memory(
     env: Any,
     raw_action: str,
@@ -555,6 +621,7 @@ def main(args):
                 "memory_scope": args.memory_scope,
                 "memory_dynamic_threshold": not args.memory_disable_dynamic_threshold,
                 "prefer_terminal_success": args.prefer_terminal_success,
+                "memory_augmented_action_format": args.memory_augmented_action_format,
                 "memory_initial_stats": correction_memory.stats(),
             },
         )
@@ -580,6 +647,10 @@ def main(args):
         "steps_with_nonzero_correction": 0,
         "argmax_changed_by_correction": 0,
         "actual_selection_changed_by_memory": 0,
+        "decisions_with_augmented_actions": 0,
+        "augmented_actions_added": 0,
+        "selected_augmented_actions": 0,
+        "selection_changed_by_augmentation": 0,
     }
     with logging_redirect_tqdm():
         pbar = tqdm(total=n_tasks)
@@ -635,6 +706,10 @@ def main(args):
                 "steps_with_nonzero_correction": 0,
                 "argmax_changed_by_correction": 0,
                 "actual_selection_changed_by_memory": 0,
+                "decisions_with_augmented_actions": 0,
+                "augmented_actions_added": 0,
+                "selected_augmented_actions": 0,
+                "selection_changed_by_augmentation": 0,
             }
             for traj_id in range(args.n_trajs):
                 init_msg, cur_traj_state = env.reset(
@@ -655,6 +730,11 @@ def main(args):
                 argmax_changed_by_correction = 0
                 decisions_changed_by_memory = 0
 
+                decisions_with_augmented_actions = 0
+                augmented_actions_added = 0
+                selected_augmented_actions = 0
+                selection_changed_by_augmentation_count = 0
+
                 for n_turn in range(env.max_steps):
                     if n_turn == 0:
                         current_node = root
@@ -673,6 +753,7 @@ def main(args):
 
                     action_list: List[str] = []
                     candidate_records: List[Dict[str, Any]] = []
+                    pre_action_admissible_commands: List[str] = []
 
                     # Generate N candidates and compute their original QLASS
                     # scores exactly as in the baseline.
@@ -698,6 +779,9 @@ def main(args):
                             f"replay_actions={replay_actions}\n"
                             f"traj_actions={traj_actions}\n"
                         )
+
+                        if idx == 0 and hasattr(env, "get_admissible_commands"):
+                            pre_action_admissible_commands = env.get_admissible_commands()
 
                         if (not idx) or args.disable_perturb:
                             cur_state_history = cur_traj_state.history
@@ -792,8 +876,131 @@ def main(args):
                                 "memory_raw_advantage": 0.0,
                                 "memory_normalized_advantage": 0.0,
                                 "memory_correction": 0.0,
+                                "candidate_source": "policy",
+                                "memory_augmented": False,
+                                "memory_aug_mean_return": 0.0,
+                                "memory_aug_match_count": 0,
+                                "memory_aug_canonical_action": "",
+                                "memory_aug_examples": [],
+                                "memory_canonical_action": "",
+                                "memory_action_examples": [],
                             }
                         )
+
+                    augmentation_result: Optional[Dict[str, Any]] = None
+
+                    if (
+                        correction_memory is not None
+                        and args.enable_memory_action_augmentation
+                    ):
+                        admissible_commands = pre_action_admissible_commands
+                        if not admissible_commands:
+                            logger.warning(
+                                "[MEMORY_AUG_NO_ADMISSIBLE_COMMANDS] task=%r attempt=%d step=%d",
+                                task.task_id,
+                                traj_id,
+                                n_turn,
+                            )
+
+                        augmentation_result = correction_memory.get_positive_actions_for_augmentation(
+                            task_text=task_text,
+                            observation=observation_before_action,
+                            previous_actions=previous_action_commands,
+                            admissible_commands=admissible_commands,
+                            existing_candidate_actions=[
+                                record["action_command"] for record in candidate_records
+                            ],
+                            inventory="",
+                            min_mean_return=args.memory_augmentation_min_mean_return,
+                            max_actions=args.memory_max_augmented_actions,
+                            max_per_canonical=args.memory_aug_max_per_canonical,
+                        )
+
+                        for aug_idx, aug_action in enumerate(augmentation_result["augmented_actions"]):
+                            action_command = aug_action["action_command"]
+                            raw_action = _build_memory_augmented_raw_action(
+                                action_command,
+                                action_format=args.memory_augmented_action_format,
+                                retrieved_raw_action_exact=aug_action.get("retrieved_raw_action_exact", ""),
+                            )
+
+                            # Replay to the current pre-action state, exactly as for policy candidates.
+                            observation, state = env.reset(num_icl_examples=args.num_icl_examples)
+                            _force_min_max_steps(env, turn_cap)
+
+                            if n_turn > 0:
+                                prefix_actions = _extract_assistant_action_msgs(
+                                    cur_traj_state.history
+                                )[:n_turn]
+                                for act_text in prefix_actions:
+                                    observation, state = env.step(act_text)
+
+                            replay_actions = _extract_assistant_action_msgs(state.history)
+                            traj_actions = _extract_assistant_action_msgs(cur_traj_state.history)
+                            assert replay_actions == traj_actions, (
+                                f"[REPLAY ACTION MISMATCH - MEMORY AUG] n_turn={n_turn}\n"
+                                f"replay_actions={replay_actions}\n"
+                                f"traj_actions={traj_actions}\n"
+                            )
+
+                            observation_after_action, new_state = env.step(raw_action)
+
+                            if new_state.finished:
+                                base_score = float(new_state.reward)
+                                score_source = "environment_terminal_reward"
+                            else:
+                                base_score = float(
+                                    evaluate_trajs_qnet_v2(
+                                        qnet,
+                                        tokenizer,
+                                        new_state,
+                                        batch_size=1,
+                                        disable_tqdm=True,
+                                        model_name=args.model_name,
+                                        debug=args.debug,
+                                    )[0]
+                                )
+                                score_source = "qnet"
+
+                            candidate_records.append(
+                                {
+                                    "candidate_id": len(candidate_records),
+                                    "state": new_state,
+                                    "raw_action": raw_action,
+                                    "action_command": action_command,
+                                    "observation_after_action": observation_after_action,
+                                    "base_score": base_score,
+                                    "corrected_score": base_score,
+                                    "score_source": score_source,
+                                    "finished": bool(new_state.finished),
+                                    "success": bool(new_state.success),
+                                    "memory_has_support": False,
+                                    "memory_match_count": 0,
+                                    "memory_mean_return": 0.0,
+                                    "memory_raw_advantage": 0.0,
+                                    "memory_normalized_advantage": 0.0,
+                                    "memory_correction": 0.0,
+                                    "candidate_source": "memory_augmentation",
+                                    "memory_augmented": True,
+                                    "memory_aug_mean_return": float(aug_action["mean_return"]),
+                                    "memory_aug_match_count": int(aug_action["match_count"]),
+                                    "memory_aug_canonical_action": aug_action["canonical_action"],
+                                    "memory_aug_examples": aug_action["memory_action_examples"],
+                                    "memory_augmented_action_format": args.memory_augmented_action_format,
+                                    "memory_aug_retrieved_raw_action_exact": aug_action.get("retrieved_raw_action_exact", ""),
+                                    "memory_aug_retrieved_raw_action_exact_count": int(
+                                        aug_action.get("retrieved_raw_action_exact_count", 0)
+                                    ),
+                                    "memory_aug_retrieved_raw_action_exact_return": float(
+                                        aug_action.get("retrieved_raw_action_exact_return", 0.0)
+                                    ),
+                                    "memory_aug_retrieved_raw_action_exact_similarity": float(
+                                        aug_action.get("retrieved_raw_action_exact_similarity", 0.0)
+                                    ),
+                                    "memory_canonical_action": "",
+                                    "memory_action_examples": [],
+                                }
+                            )
 
                     # Retrieval is performed once for the pre-action state.
                     # The memory class returns neutral advantages for actions
@@ -837,6 +1044,8 @@ def main(args):
                                     "memory_normalized_advantage": normalized_advantage,
                                     "memory_correction": correction,
                                     "corrected_score": record["base_score"] + correction,
+                                    "memory_canonical_action": memory_score.get("canonical_action", ""),
+                                    "memory_action_examples": memory_score.get("memory_action_examples", []),
                                 }
                             )
 
@@ -939,6 +1148,51 @@ def main(args):
                     decisions_changed_by_memory += int(selection_changed_by_memory)
 
                     selected_record = candidate_records[selected_idx]
+                    num_augmented = sum(
+                        int(record.get("memory_augmented", False))
+                        for record in candidate_records
+                    )
+                    selected_is_augmented = bool(selected_record.get("memory_augmented", False))
+
+                    # Best among only policy candidates, before adding memory candidates.
+                    policy_candidate_indices = [
+                        idx for idx, record in enumerate(candidate_records)
+                        if record.get("candidate_source") == "policy"
+                    ]
+                    policy_base_best_idx = max(
+                        policy_candidate_indices,
+                        key=lambda idx: candidate_records[idx]["base_score"],
+                    )
+
+                    selection_changed_by_augmentation_step = bool(
+                        args.enable_memory_action_augmentation
+                        and selected_is_augmented
+                        and policy_base_best_idx != selected_idx
+                    )
+                    if correction_memory is not None:
+                        memory_run_stats["decisions_with_augmented_actions"] += int(num_augmented > 0)
+                        task_memory_stats["decisions_with_augmented_actions"] += int(num_augmented > 0)
+
+                        memory_run_stats["augmented_actions_added"] += num_augmented
+                        task_memory_stats["augmented_actions_added"] += num_augmented
+
+                        memory_run_stats["selected_augmented_actions"] += int(selected_is_augmented)
+                        task_memory_stats["selected_augmented_actions"] += int(selected_is_augmented)
+
+                        memory_run_stats["selection_changed_by_augmentation"] += int(
+                            selection_changed_by_augmentation_step
+                        )
+                        task_memory_stats["selection_changed_by_augmentation"] += int(
+                            selection_changed_by_augmentation_step
+                        )
+
+                    decisions_with_augmented_actions += int(num_augmented > 0)
+                    augmented_actions_added += num_augmented
+                    selected_augmented_actions += int(selected_is_augmented)
+                    selection_changed_by_augmentation_count += int(
+                        selection_changed_by_augmentation_step
+                    )
+
                     for candidate_idx, record in enumerate(candidate_records):
                         record["selected"] = candidate_idx == selected_idx
 
@@ -1006,6 +1260,15 @@ def main(args):
                                     }
                                     for record in candidate_records
                                 ],
+                                "augmentation_enabled": args.enable_memory_action_augmentation,
+                                "num_augmented_candidates": num_augmented,
+                                "selected_is_augmented": selected_is_augmented,
+                                "selection_changed_by_augmentation": selection_changed_by_augmentation_step,
+                                "augmentation_result": None if augmentation_result is None else {
+                                    "num_positive_patterns": augmentation_result["num_positive_patterns"],
+                                    "augmented_actions": augmentation_result["augmented_actions"],
+                                    "positive_patterns": augmentation_result["positive_patterns"],
+                                },
                             },
                         )
                         if selection_changed_by_memory:
@@ -1086,6 +1349,10 @@ def main(args):
                             "steps_with_nonzero_correction": steps_with_nonzero_correction,
                             "argmax_changed_by_correction": argmax_changed_by_correction,
                             "decisions_changed_by_memory": decisions_changed_by_memory,
+                            "decisions_with_augmented_actions": decisions_with_augmented_actions,
+                            "augmented_actions_added": augmented_actions_added,
+                            "selected_augmented_actions": selected_augmented_actions,
+                            "selection_changed_by_augmentation": selection_changed_by_augmentation_count,
                         },
                     )
                     _append_jsonl_record(
@@ -1103,6 +1370,10 @@ def main(args):
                             "decisions_changed_by_memory": decisions_changed_by_memory,
                             "memory_update": memory_update,
                             "memory_stats_after": correction_memory.stats(),
+                            "decisions_with_augmented_actions": decisions_with_augmented_actions,
+                            "augmented_actions_added": augmented_actions_added,
+                            "selected_augmented_actions": selected_augmented_actions,
+                            "selection_changed_by_augmentation": selection_changed_by_augmentation_count,
                         },
                     )
 
@@ -1120,6 +1391,10 @@ def main(args):
                         "argmax_changed_by_correction": argmax_changed_by_correction,
                         "decisions_changed_by_memory": decisions_changed_by_memory,
                         "memory_update": memory_update,
+                        "decisions_with_augmented_actions": decisions_with_augmented_actions,
+                        "augmented_actions_added": augmented_actions_added,
+                        "selected_augmented_actions": selected_augmented_actions,
+                        "selection_changed_by_augmentation": selection_changed_by_augmentation_count,
                     }
                 all_trajs.append(trajectory_record)
 
@@ -1480,6 +1755,44 @@ if __name__ == "__main__":
             "in the environment, select it regardless of corrected score. "
             "Disabled by default to preserve the original QLASS selection "
             "behavior when memory_weight=0."
+        ),
+    )
+    parser.add_argument(
+        "--enable_memory_action_augmentation",
+        action="store_true",
+        help=(
+            "Add promising admissible actions from episodic memory to the QLASS "
+            "candidate set before QNet scoring."
+        ),
+    )
+    parser.add_argument(
+        "--memory_max_augmented_actions",
+        type=int,
+        default=2,
+        help="Maximum number of memory-augmented actions added per decision step.",
+    )
+    parser.add_argument(
+        "--memory_aug_max_per_canonical",
+        type=int,
+        default=1,
+        help="Maximum number of admissible commands added per canonical memory action.",
+    )
+    parser.add_argument(
+        "--memory_augmentation_min_mean_return",
+        type=float,
+        default=1e-12,
+        help="Minimum mean memory return required to add an action pattern.",
+    )
+    parser.add_argument(
+        "--memory_augmented_action_format",
+        type=str,
+        choices=["action_only", "generic_thought", "retrieved_thought_exact_only"],
+        default="action_only",
+        help=(
+            "How to format memory-augmented candidates before QNet scoring. "
+            "retrieved_thought_exact_only uses stored reasoning only when the "
+            "current admissible command exactly matches a positive retrieved memory action; "
+            "otherwise it falls back to generic_thought."
         ),
     )
 

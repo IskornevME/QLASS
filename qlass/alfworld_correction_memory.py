@@ -319,10 +319,14 @@ class AlfWorldCorrectionMemory:
         previous_actions: List[str] = []
 
         for step_index, step in enumerate(executed_steps):
-            raw_action = self._safe_text(
+            action_source = self._safe_text(
                 step.get("action_command", step.get("action", ""))
             )
-            action = self.normalize_action(raw_action)
+            action = self.normalize_action(action_source)
+
+            raw_action = self._safe_text(
+                step.get("raw_action", action_source)
+            )
 
             if not action:
                 raise ValueError(
@@ -471,6 +475,10 @@ class AlfWorldCorrectionMemory:
             self.normalize_action(action)
             for action in candidate_actions
         ]
+        canonical_candidates = [
+            self.canonicalize_action(action)
+            for action in normalized_candidates
+        ]
 
         if not neighbors:
             retrieval_result.update(
@@ -481,10 +489,12 @@ class AlfWorldCorrectionMemory:
                         self._unsupported_candidate_score(
                             input_action=raw_action,
                             normalized_action=normalized_action,
+                            canonical_action=canonical_action,
                         )
-                        for raw_action, normalized_action in zip(
+                        for raw_action, normalized_action, canonical_action in zip(
                             candidate_actions,
                             normalized_candidates,
+                            canonical_candidates,
                         )
                     ],
                 }
@@ -497,11 +507,18 @@ class AlfWorldCorrectionMemory:
         # should describe the complete retrieved local neighborhood, as in
         # the JitRL advantage computation.
         returns_by_action: Dict[str, List[float]] = defaultdict(list)
+        exact_examples_by_canonical: Dict[str, List[str]] = defaultdict(list)
 
         for neighbor in neighbors:
-            returns_by_action[neighbor["action"]].append(
+            exact_action = neighbor["action"]
+            canonical_action = self.canonicalize_action(exact_action)
+            if not canonical_action:
+                continue
+
+            returns_by_action[canonical_action].append(
                 float(neighbor["discounted_return"])
             )
+            exact_examples_by_canonical[canonical_action].append(exact_action)
 
         all_returns = [
             discounted_return
@@ -527,15 +544,17 @@ class AlfWorldCorrectionMemory:
 
         candidate_scores: List[Dict[str, Any]] = []
 
-        for raw_action, normalized_action in zip(
+        for raw_action, normalized_action, canonical_action in zip(
             candidate_actions,
             normalized_candidates,
+            canonical_candidates,
         ):
-            if normalized_action not in returns_by_action:
+            if canonical_action not in returns_by_action:
                 candidate_scores.append(
                     self._unsupported_candidate_score(
                         input_action=raw_action,
                         normalized_action=normalized_action,
+                        canonical_action=canonical_action,
                     )
                 )
                 continue
@@ -544,15 +563,13 @@ class AlfWorldCorrectionMemory:
                 {
                     "input_action": raw_action,
                     "normalized_action": normalized_action,
+                    "canonical_action": canonical_action,
                     "has_memory_support": True,
-                    "match_count": len(
-                        returns_by_action[normalized_action]
-                    ),
-                    "mean_return": mean_return_by_action[normalized_action],
-                    "raw_advantage": raw_advantages[normalized_action],
-                    "normalized_advantage": normalized_advantages[
-                        normalized_action
-                    ],
+                    "match_count": len(returns_by_action[canonical_action]),
+                    "mean_return": mean_return_by_action[canonical_action],
+                    "raw_advantage": raw_advantages[canonical_action],
+                    "normalized_advantage": normalized_advantages[canonical_action],
+                    "memory_action_examples": exact_examples_by_canonical[canonical_action][:3],
                 }
             )
 
@@ -560,15 +577,17 @@ class AlfWorldCorrectionMemory:
             {
                 "baseline_return": baseline_return,
                 "action_reward_support": {
-                    action: {
+                    canonical_action: {
                         "returns": list(action_returns),
                         "match_count": len(action_returns),
-                        "mean_return": mean_return_by_action[action],
-                        "raw_advantage": raw_advantages[action],
-                        "normalized_advantage": normalized_advantages[action],
+                        "mean_return": mean_return_by_action[canonical_action],
+                        "raw_advantage": raw_advantages[canonical_action],
+                        "normalized_advantage": normalized_advantages[canonical_action],
+                        "exact_action_examples": exact_examples_by_canonical[canonical_action][:3],
                     }
-                    for action, action_returns in returns_by_action.items()
+                    for canonical_action, action_returns in returns_by_action.items()
                 },
+                "action_key_mode": "canonical",
                 "candidate_scores": candidate_scores,
             }
         )
@@ -838,6 +857,157 @@ class AlfWorldCorrectionMemory:
 
         return discounted_return
 
+    def get_positive_actions_for_augmentation(
+        self,
+        *,
+        task_text: str,
+        observation: str,
+        previous_actions: Sequence[str],
+        admissible_commands: Sequence[str],
+        existing_candidate_actions: Sequence[str],
+        inventory: str = "",
+        min_mean_return: float = 1e-12,
+        max_actions: int = 2,  # сколько максимум кандидатов добавляем
+        max_per_canonical: int = 1,  # сколько примеров на канон мы добавляем в кандидаты 
+    ) -> Dict[str, Any]:
+        """Return promising current admissible commands matched via memory.
+
+        This method does not return raw actions from old episodes. It uses old actions only as canonical patterns and instantiates them through current
+        admissible commands.
+        """
+
+        retrieval_result = self.retrieve(
+            task_text=task_text,
+            observation=observation,
+            previous_actions=previous_actions,
+            inventory=inventory,
+        )
+
+        neighbors = retrieval_result["neighbors"]
+
+        existing_exact = {
+            self.normalize_action(action)
+            for action in existing_candidate_actions
+        }
+
+        admissible_by_canonical: Dict[str, List[str]] = defaultdict(list)
+        for command in admissible_commands:
+            exact = self.normalize_action(command)
+            canonical = self.canonicalize_action(exact)
+            if not exact or exact in existing_exact:
+                continue
+            admissible_by_canonical[canonical].append(exact)
+
+        returns_by_canonical: Dict[str, List[float]] = defaultdict(list)
+        examples_by_canonical: Dict[str, List[str]] = defaultdict(list)
+        raw_actions_by_exact: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+
+        for neighbor in neighbors:
+            memory_action = neighbor["action"]
+            canonical = self.canonicalize_action(memory_action)
+            if canonical not in admissible_by_canonical:
+                continue
+
+            discounted_return = float(neighbor["discounted_return"])
+
+            returns_by_canonical[canonical].append(discounted_return)
+            examples_by_canonical[canonical].append(memory_action)
+
+            raw_action = self._safe_text(neighbor.get("raw_action", ""))
+            if raw_action and discounted_return > min_mean_return:
+                raw_actions_by_exact[memory_action].append(
+                    {
+                        "raw_action": raw_action,
+                        "discounted_return": discounted_return,
+                        "similarity": float(neighbor.get("similarity", 0.0)),
+                    }
+                )
+
+        positive_patterns = []
+        for canonical, returns in returns_by_canonical.items():
+            mean_return = mean(returns)
+            if mean_return <= min_mean_return:
+                continue
+
+            positive_patterns.append(
+                {
+                    "canonical_action": canonical,
+                    "mean_return": mean_return,
+                    "match_count": len(returns),
+                    "memory_action_examples": examples_by_canonical[canonical][:3],
+                    "candidate_commands": admissible_by_canonical[canonical],
+                }
+            )
+
+        positive_patterns.sort(
+            key=lambda item: (item["mean_return"], item["match_count"]),
+            reverse=True,
+        )
+
+        augmented_actions = []
+        used_exact = set(existing_exact)
+
+        for pattern in positive_patterns:
+            added_for_pattern = 0
+
+            for command in pattern["candidate_commands"]:
+                exact = self.normalize_action(command)
+                if exact in used_exact:
+                    continue
+
+                exact_raw_actions = sorted(
+                    raw_actions_by_exact.get(exact, []),
+                    key=lambda item: (
+                        item["discounted_return"],
+                        item["similarity"],
+                    ),
+                    reverse=True,
+                )
+                best_exact_raw_action = (
+                    exact_raw_actions[0]["raw_action"]
+                    if exact_raw_actions
+                    else ""
+                )
+
+                augmented_actions.append(
+                    {
+                        "action_command": exact,
+                        "canonical_action": pattern["canonical_action"],
+                        "mean_return": pattern["mean_return"],
+                        "match_count": pattern["match_count"],
+                        "memory_action_examples": pattern["memory_action_examples"],
+                        "retrieved_raw_action_exact": best_exact_raw_action,
+                        "retrieved_raw_action_exact_count": len(exact_raw_actions),
+                        "retrieved_raw_action_exact_return": (
+                            exact_raw_actions[0]["discounted_return"]
+                            if exact_raw_actions
+                            else 0.0
+                        ),
+                        "retrieved_raw_action_exact_similarity": (
+                            exact_raw_actions[0]["similarity"]
+                            if exact_raw_actions
+                            else 0.0
+                        ),
+                    }
+                )
+                used_exact.add(exact)
+                added_for_pattern += 1
+
+                if added_for_pattern >= max_per_canonical:
+                    break
+                if len(augmented_actions) >= max_actions:
+                    break
+
+            if len(augmented_actions) >= max_actions:
+                break
+
+        return {
+            "retrieval": retrieval_result,
+            "num_positive_patterns": len(positive_patterns),
+            "positive_patterns": positive_patterns[:10],
+            "augmented_actions": augmented_actions,
+        }
+
     # ------------------------------------------------------------------
     # Action normalization and similarity computation
     # ------------------------------------------------------------------
@@ -853,6 +1023,28 @@ class AlfWorldCorrectionMemory:
 
         text = "" if action is None else str(action)
         return re.sub(r"\s+", " ", text.strip().lower())
+
+    @classmethod
+    def canonicalize_action(cls, action: Any) -> str:
+        """Canonicalize ALFWorld action by removing object instance ids.
+
+        Examples:
+            take apple 1 from countertop 2
+            -> take apple <id> from countertop <id>
+
+            put lettuce 2 in fridge 1
+            -> put lettuce <id> in fridge <id>
+        """
+        normalized = cls.normalize_action(action)
+        if not normalized:
+            return ""
+
+        tokens = normalized.split()
+        canonical_tokens = [
+            "<id>" if token.isdigit() else token
+            for token in tokens
+        ]
+        return " ".join(canonical_tokens)
 
     @staticmethod
     def _tokenize(text: str) -> List[str]:
@@ -981,18 +1173,20 @@ class AlfWorldCorrectionMemory:
         *,
         input_action: str,
         normalized_action: str,
+        canonical_action: str = "",
     ) -> Dict[str, Any]:
         """Return neutral memory correction for an unsupported candidate."""
 
         return {
-            "input_action": input_action,
-            "normalized_action": normalized_action,
-            "has_memory_support": False,
-            "match_count": 0,
-            "mean_return": 0.0,
-            "raw_advantage": 0.0,
-            "normalized_advantage": 0.0,
-        }
+        "input_action": input_action,
+        "normalized_action": normalized_action,
+        "canonical_action": canonical_action,
+        "has_memory_support": False,
+        "match_count": 0,
+        "mean_return": 0.0,
+        "raw_advantage": 0.0,
+        "normalized_advantage": 0.0,
+    }
 
     # ------------------------------------------------------------------
     # Persistence helpers
