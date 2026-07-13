@@ -18,20 +18,20 @@ micro_batch_size=${MICRO_BATCH_SIZE:-1}
 accumulation_step=$((${batch_size}/${node_num}/${micro_batch_size}))
 
 # Dueling data. Recommended: create these files with split_dueling_q_data.py.
-data_dir=${DATA_DIR:-data/train/${task}/explore_7b_sft_d8_i0_s2_mpr3}
-q_data_train_path=${Q_DATA_TRAIN_PATH:-${data_dir}/dueling_vanilla_raw_train.json}
-q_data_val_path=${Q_DATA_VAL_PATH:-${data_dir}/dueling_vanilla_raw_val.json}
+data_dir=${DATA_DIR:-data/train/${task}/dueling_combined_all}
+q_data_train_path=${Q_DATA_TRAIN_PATH:-${data_dir}/dueling_vanilla_raw_combined_all_train.json}
+q_data_val_path=${Q_DATA_VAL_PATH:-${data_dir}/dueling_vanilla_raw_combined_all_val.json}
 
 # Model names.
 base_exp_name=${exp_name}-${model_name}-${task}-DuelingQ-raw
 sft_model_name=${exp_name}-${model_name}-${task}-sft_run1
 
 # Hyperparameters. Defaults match the original QNet launch where applicable.
-learning_rate=${LEARNING_RATE:-1e-5}
+learning_rate=${LEARNING_RATE:-5e-6}
 weight_decay=${WEIGHT_DECAY:-0.}
 warmup_ratio=${WARMUP_RATIO:-0.03}
 lr_scheduler_type=${LR_SCHEDULER_TYPE:-cosine}
-num_train_epochs=${NUM_TRAIN_EPOCHS:-2}
+num_train_epochs=${NUM_TRAIN_EPOCHS:-1}
 seed=${SEED:-42}
 
 # Dueling-specific hyperparameters.
@@ -44,8 +44,8 @@ drop_state_mismatch=${DROP_STATE_MISMATCH:-False}
 # Logging/eval/save cadence. For load_best_model_at_end=True, save_steps must be
 # aligned with eval_steps; by default we keep the original QNet save cadence.
 logging_steps=${LOGGING_STEPS:-5}
-eval_steps=${EVAL_STEPS:-200}
-save_steps=${SAVE_STEPS:-200}
+eval_steps=${EVAL_STEPS:-800}
+save_steps=${SAVE_STEPS:-800}
 save_total_limit=${SAVE_TOTAL_LIMIT:-2}
 
 # Unique run id. You can override it, e.g. RUN_ID=raw_lr1e-5_vcoef0.1_seed42.
@@ -62,7 +62,7 @@ logging_dir=${LOGGING_DIR:-${experiment_root}/tensorboard/${run_id}}
 
 mkdir -p "${output_dir}" "${logging_dir}"
 
-export CUDA_VISIBLE_DEVICES=1,2
+export CUDA_VISIBLE_DEVICES=1,3
 
 echo "[train_dueling_qnet_7b] run_id=${run_id}"
 echo "[train_dueling_qnet_7b] output_dir=${output_dir}"
@@ -85,7 +85,7 @@ else
     eval_args+=(--eval_strategy "no")
 fi
 
-CUDA_VISIBLE_DEVICES=1,2 python -m torch.distributed.run \
+CUDA_VISIBLE_DEVICES=1,3 python -m torch.distributed.run \
     --nproc_per_node=${node_num} \
     --master_port=20002 \
     qlass/train_dueling_q.py \
