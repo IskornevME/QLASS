@@ -343,6 +343,22 @@ def _append_jsonl_record(path: Optional[str], record: Mapping[str, Any]) -> None
         log_file.write(json.dumps(dict(record), ensure_ascii=False) + "\n")
 
 
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    """Convert optional numeric values to float.
+
+    ALFWorld State.reward can be None for non-terminal states.
+    """
+    if value is None:
+        return default
+
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return default
+
+    return result if np.isfinite(result) else default
+
+
 def _extract_assistant_action_msgs(history: Sequence[Mapping[str, Any]]) -> List[str]:
     """Return assistant responses that were actually submitted to the environment."""
     actions: List[str] = []
@@ -837,7 +853,7 @@ def main(args):
                         # an observed environment value; any non-terminal
                         # action is evaluated by QNet.
                         if new_state.finished:
-                            base_score = float(new_state.reward)
+                            base_score = _safe_float(new_state.reward)
                             score_source = "environment_terminal_reward"
                         else:
                             base_score = float(
@@ -946,7 +962,7 @@ def main(args):
                             observation_after_action, new_state = env.step(raw_action)
 
                             if new_state.finished:
-                                base_score = float(new_state.reward)
+                                base_score = _safe_float(new_state.reward)
                                 score_source = "environment_terminal_reward"
                             else:
                                 base_score = float(
@@ -1005,6 +1021,7 @@ def main(args):
                     # Retrieval is performed once for the pre-action state.
                     # The memory class returns neutral advantages for actions
                     # without support and never introduces new actions.
+                    trajectory_final_reward = _safe_float(cur_traj_state.reward)
                     memory_result: Optional[Dict[str, Any]] = None
                     if correction_memory is not None:
                         memory_result = correction_memory.score_candidates(
@@ -1317,7 +1334,8 @@ def main(args):
                             "inventory_before_action": "",
                             "action_command": selected_record["action_command"],
                             "raw_action": selected_record["raw_action"],
-                            "env_reward": float(new_state.reward),
+                            "env_reward": _safe_float(new_state.reward),
+                            "env_reward_missing": new_state.reward is None,
                             "base_q_score": selected_record["base_score"],
                             "memory_normalized_advantage": selected_record[
                                 "memory_normalized_advantage"
@@ -1341,7 +1359,7 @@ def main(args):
                     memory_update = correction_memory.add_episode(
                         executed_steps=executed_steps,
                         success=bool(cur_traj_state.success),
-                        final_reward=float(cur_traj_state.reward),
+                        final_reward=trajectory_final_reward,
                         task_id=task.task_id,
                         attempt_id=traj_id,
                         episode_metadata={
@@ -1364,7 +1382,7 @@ def main(args):
                             "attempt_id": traj_id,
                             "trajectory_length": len(executed_steps),
                             "success": bool(cur_traj_state.success),
-                            "final_reward": float(cur_traj_state.reward),
+                            "final_reward": trajectory_final_reward,
                             "steps_with_nonzero_correction": steps_with_nonzero_correction,
                             "argmax_changed_by_correction": argmax_changed_by_correction,
                             "decisions_changed_by_memory": decisions_changed_by_memory,
@@ -1460,12 +1478,14 @@ def main(args):
         pbar.close()
 
     n_traj = len(total_examples)
-    n_success = sum([ 1. if traj['reward']==1.0 else 0. for traj in total_examples])
-    rewards = [traj['reward'] for traj in total_examples]
+    rewards = [_safe_float(traj.get("reward", 0.0)) for traj in total_examples]
+    n_success = sum(1.0 for reward in rewards if reward == 1.0)
+    average_reward = sum(rewards) / n_traj if n_traj > 0 else 0.0
+
     print(f"Finally, The Number of Successful Trajectories: {n_success} / {n_traj} ")
     print(f"Finally, The Number of Successful Trajectories with multi evaluation: {mult_success_num} / {n_tasks} ")
     print(f"Finally, The Number of Successful Trajectories with first inference: {num_first_success} / {n_tasks} ")
-    print(f"Average Reward: {sum(rewards) / n_traj}")
+    print(f"Average Reward: {average_reward}")
     if correction_memory is not None:
         decision_steps = memory_run_stats["decision_steps"]
         argmax_change_rate = (
@@ -1497,7 +1517,7 @@ def main(args):
                 "record_type": "run_summary",
                 "num_trajectories": n_traj,
                 "num_success": n_success,
-                "average_reward": sum(rewards) / n_traj if n_traj > 0 else 0.0,
+                "average_reward": average_reward,
                 "memory_stats": memory_run_stats,
                 "argmax_change_rate": argmax_change_rate,
                 "actual_selection_change_rate": actual_change_rate,

@@ -8,12 +8,12 @@ Implemented:
 - Jaccard-only retrieval for ALFWorld;
 - discounted returns computed at retrieval time;
 - memory advantages for actions already proposed by QLASS.
+- optional memory-based action augmentation via current admissible commands.
 
 Intentionally NOT implemented:
-- adding retrieved memory actions to the candidate set (will be done later);
-- optimistic exploration bonuses for unsupported actions;
+- direct insertion of stale raw memory actions;
+- optimistic exploration bonuses;
 - changing the memory correction weight over episodes.
-
 Important:
 Only actions that were actually selected and executed in a completed
 trajectory may be passed to "add_episode". Candidate branches temporarily
