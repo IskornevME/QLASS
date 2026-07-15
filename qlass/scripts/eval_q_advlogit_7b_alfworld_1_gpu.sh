@@ -10,12 +10,7 @@ save_dir=${MODEL_PATH}    # checkpoint save path
 
 QNET_STEP=14382
 # sft_model_name=${exp_name}-${model_name}-${task}-sft_run1
-sft_model_name=${exp_name}-${model_name}-${task}-sft
-# q_model_name=${exp_name}-${model_name}-${task}-Q_my
-q_model_name=${exp_name}-${model_name}-${task}-Q
-# q_model_name_checkpoint=${q_model_name}/infer-checkpoint-${QNET_STEP}
-q_model_name_checkpoint=${q_model_name}
-
+sft_model_name=${exp_name}-${model_name}-${task}-sft_run1
 
 export OPENAI_API_KEY="${OPENAI_API_KEY:-dummy}"
 
@@ -25,7 +20,7 @@ sg_worker_port=21009
 
 mkdir -p logs_q_inf
 
-SERVER_GPU=1
+SERVER_GPU=0
 WORKER_GPU=2
 
 setsid bash -c "
@@ -104,7 +99,8 @@ N_TRAJS=${N_TRAJS:-3}
 # Actor + Q-Adv correction:
 # corrected_score = ACTOR_LOGPROB_COEF * actor_logprob_mean + Q_ADV_BETA * zscore(QNet/env scores)
 SELECTION_STRATEGY=${SELECTION_STRATEGY:-dueling_adv_logit_argmax}
-DUELING_QNET_PATH=${DUELING_QNET_PATH:-"${save_dir}qlass-Llama-2-7b-chat-hf-alfworld-DuelingQ-raw/runs/raw_lr5e-6_bs64_vcoef0.1_seed42_20260712_190342/checkpoint-2567"}
+# DUELING_QNET_PATH=${DUELING_QNET_PATH:-"${save_dir}qlass-Llama-2-7b-chat-hf-alfworld-DuelingQ-raw/runs/raw_lr5e-6_bs64_vcoef0.1_seed42_20260712_190342/checkpoint-2567"}
+DUELING_QNET_PATH=${DUELING_QNET_PATH:-"${save_dir}qlass-Llama-2-7b-chat-hf-alfworld-DuelingQ-raw/runs/raw_lr1e-5_bs64_vcoef0.1_seed42_20260702_045546/checkpoint-1034"}
 DUELING_PROMPT_MODEL_NAME=${DUELING_PROMPT_MODEL_NAME:-"${save_dir}${sft_model_name}"}
 DUELING_ADVANTAGE_NORM=${DUELING_ADVANTAGE_NORM:-zscore}
 if [[ "${SELECTION_STRATEGY}" == dueling_adv_logit_* ]]; then

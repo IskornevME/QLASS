@@ -265,7 +265,7 @@ def recover_changed_steps_from_action_value_dict(
     }
 
 
-def aggregate_unique_candidates_per_step(trajectories):
+def aggregate_unique_candidates_per_step(trajectories, args):
     num_steps = 0
 
     total_candidate_records = 0
@@ -303,7 +303,7 @@ def aggregate_unique_candidates_per_step(trajectories):
 
             if n_unique == 1:
                 steps_with_all_duplicate_actions += 1
-            if n_unique == len(step_candidates):
+            if n_unique >= args.expected_bon:
                 steps_with_full_bon_unique_actions += 1
 
     if num_steps == 0:
@@ -356,6 +356,7 @@ def main() -> None:
     parser.add_argument("--output_dir", type=str, default=None)
     parser.add_argument("--slice_num", type=int, default=None)
     parser.add_argument("--sample_mode", type=str, default="bon")
+    parser.add_argument("--expected_bon", type=int, default=2)
     parser.add_argument("--n_trajs", type=int, default=3)
 
     # Backward-compatible old-style path construction.
@@ -464,7 +465,7 @@ def main() -> None:
         all_trajs,
         max_examples=args.max_changed_examples,
     )
-    unique_candidates_stats = aggregate_unique_candidates_per_step(all_trajs)
+    unique_candidates_stats = aggregate_unique_candidates_per_step(all_trajs, args)
 
     print_metric_block("CORRECTION_STATS_SAVED_PER_TRAJECTORY", saved_corr)
     print_metric_block(
