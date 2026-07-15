@@ -3,91 +3,92 @@ import json
 import os
 
 data_dir = './data/train/alfworld/'
-model_name = 'qlass-Llama-2-7b-chat-hf-alfworld-sft_run1'
+model_name = 'qlass-Llama-2-7b-chat-hf-alfworld-sft'
+# inference_type = 'q_correction_memory_without_perturb'
 inference_type = 'q_without_perturb'
-eval_name = 'debug_bon2_test'
-slice_num = 2
+# eval_name = 'debug_bon2_test_run_aug_only_0_lambda0.0_gamma0.97_k10_thr0.75_global_no_terminal_override_aug2_percanon1_retrieved_thought_exact_only'
+eval_name = 'debug_bon2_test_run_0'
+slice_num = 1
 file_list = []
 for i in range(slice_num):
     file_path = os.path.join(data_dir, model_name, inference_type, eval_name, f"{i}of{slice_num}_slices_bon_traj.jsonl")
     file_list.append(file_path)
 
-total_max = 0
-total_max_list = 0
-total_bon = 0
-total_bon_list = 0
-total_first = 0
-total_first_list = 0
-for file in file_list:
-    test_data = json.load(open(file, "r"))
-    print(len(test_data))
-    # gap = 3
-    # print("gap:", gap)
-    # reward_list = [traj['reward'] for traj in test_data]
-    # print(f"{reward_list=}")
-    # print("avg reward:", sum(reward_list) / len(reward_list))
-    # mult_success_list = []
-    # first_success_list = []
-    # bon_success_list = []
-    # for i in range(0, len(reward_list), gap):
-    #     msn = 0
-    #     if reward_list[i] == 1.0:
-    #         first_success_list.append(1.0)
-    #     else:
-    #         first_success_list.append(0.0)
+from collections import Counter, defaultdict
+from statistics import mean
 
-    #     for j in range(i, i + gap):
-    #         if reward_list[j] == 1.0:
-    #             msn += 1
-    #     if msn > 1:
-    #         mult_success_list.append(1.0)
-    #     else:
-    #         mult_success_list.append(0.0)
-        
-    #     if msn > 0:
-    #         bon_success_list.append(1.0)
-    #     else:
-    #         bon_success_list.append(0.0)
 
-    # # Compute the average of the max values
-    # avg_max_reward = sum(mult_success_list) / len(mult_success_list)
-    # total_max += sum(mult_success_list)
-    # total_max_list += len(mult_success_list)
-    # total_first += sum(first_success_list)
-    # total_first_list += len(first_success_list)
-    # total_bon += sum(bon_success_list)
-    # total_bon_list += len(bon_success_list)
-    # print(f"avg max of every {gap} rewards:", avg_max_reward)
-    gap = 3  # n_trajs
-    print("gap (n_trajs):", gap)
-    reward_list = [float(traj['reward']) for traj in test_data]
-    print("avg reward over ALL trajectories:", sum(reward_list) / len(reward_list))
+def trajectory_score(traj):
+    """Binary ALFWorld score, robust to reward=None."""
+    success = traj.get("success")
 
-    assert len(reward_list) % gap == 0, f"len(reward_list)={len(reward_list)} not divisible by gap={gap}"
+    if success is not None:
+        if isinstance(success, str):
+            return float(success.strip().lower() == "true")
+        return float(bool(success))
 
-    first_reward_list = []
-    best_reward_list = []
-    mean_reward_list = []
+    reward = traj.get("reward")
+    return 0.0 if reward is None else float(reward)
 
-    for i in range(0, len(reward_list), gap):
-        chunk = reward_list[i:i+gap]
-        first_reward_list.append(chunk[0])
-        best_reward_list.append(max(chunk))
-        mean_reward_list.append(sum(chunk) / len(chunk))
 
-    # Totals across slices
-    total_first += sum(first_reward_list)
-    total_first_list += len(first_reward_list)
-    total_bon += sum(best_reward_list)          # reuse "bon" bucket = best-of-N trajectories reward
-    total_bon_list += len(best_reward_list)
-    total_max += sum(mean_reward_list)          # reuse "max" bucket = mean-of-N trajectories reward
-    total_max_list += len(mean_reward_list)
+# Сначала объединяем все slices.
+all_trajs = []
 
-    print("avg FIRST trajectory reward:", sum(first_reward_list) / len(first_reward_list))
-    print(f"avg BEST-of-{gap} trajectories reward:", sum(best_reward_list) / len(best_reward_list))
-    print(f"avg MEAN-of-{gap} trajectories reward:", sum(mean_reward_list) / len(mean_reward_list))
+for path in file_list:
+    with open(path, "r", encoding="utf-8") as f:
+        slice_data = json.load(f)
 
-print("avg total max:", total_max / total_max_list)
-print("avg total first:", total_first / total_first_list)
-print("avg total bon:", total_bon / total_bon_list)
-print("num tasks:", total_bon_list)
+    print(f"{path}: {len(slice_data)} trajectories")
+    all_trajs.extend(slice_data)
+
+
+# Группируем попытки по task id, поэтому n_trajs не нужно хардкодить.
+scores_by_task = defaultdict(list)
+
+for traj in all_trajs:
+    task_id = traj.get("id")
+    if task_id is None:
+        raise ValueError("Trajectory without task id.")
+
+    scores_by_task[str(task_id)].append(trajectory_score(traj))
+
+
+attempt_count_distribution = Counter(
+    len(scores) for scores in scores_by_task.values()
+)
+print("attempt counts per task:", dict(attempt_count_distribution))
+
+if len(attempt_count_distribution) != 1:
+    raise ValueError(
+        "Different tasks have different numbers of trajectories: "
+        f"{dict(attempt_count_distribution)}"
+    )
+
+n_trajs = next(iter(attempt_count_distribution))
+task_scores = list(scores_by_task.values())
+
+first_score = mean(scores[0] for scores in task_scores)
+last_score = mean(scores[-1] for scores in task_scores)
+mean_score = mean(mean(scores) for scores in task_scores)
+best_score = mean(max(scores) for scores in task_scores)
+
+print(f"num tasks: {len(task_scores)}")
+print(f"n_trajs: {n_trajs}")
+print(f"first_trajectory_avg_reward: {first_score:.6f}")
+print(f"last_trajectory_avg_reward:  {last_score:.6f}")
+print(f"best_of_{n_trajs}_avg_reward: {best_score:.6f}")
+print(f"mean_of_{n_trajs}_avg_reward: {mean_score:.6f}")
+
+print("\nsuccess_rate_by_attempt:")
+for attempt_id in range(n_trajs):
+    attempt_scores = [scores[attempt_id] for scores in task_scores]
+    print(
+        f"  attempt {attempt_id}: "
+        f"{mean(attempt_scores):.6f} "
+        f"({int(sum(attempt_scores))}/{len(attempt_scores)})"
+    )
+
+print("\nbest_of_k curve:")
+for k in range(1, n_trajs + 1):
+    best_of_k = mean(max(scores[:k]) for scores in task_scores)
+    print(f"  best_of_{k}: {best_of_k:.6f}")
