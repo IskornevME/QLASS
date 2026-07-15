@@ -78,27 +78,38 @@ mkdir -p "${OUT_DIR}" "${MEMORY_DIR}" "${LOG_DIR}"
 SERVER_LOG="${LOG_DIR}/${EXP_NAME}_sglang_server.log"
 INFERENCE_LOG="${LOG_DIR}/${EXP_NAME}_q_correction_inference.log"
 
-MEMORY_ARGS=(
-  --enable_memory_correction
-  --memory_dir "${MEMORY_DIR}"
-  --memory_log_file "${MEMORY_LOG_FILE}"
-  --memory_weight "${MEMORY_WEIGHT}"
-  --memory_gamma "${MEMORY_GAMMA}"
-  --memory_top_k "${MEMORY_TOP_K}"
-  --memory_threshold "${MEMORY_THRESHOLD}"
-  --memory_reward_mode terminal_only
-  --no-memory_use_env_reward_fallback
-  --memory_terminal_step_penalty "${MEMORY_TERMINAL_STEP_PENALTY}"
-  --memory_scope "${MEMORY_SCOPE}"
-)
-if [[ "${RESET_MEMORY}" == "1" ]]; then
-  MEMORY_ARGS+=(--reset_memory)
-fi
-if [[ "${DISABLE_DYNAMIC_THRESHOLD}" == "1" ]]; then
-  MEMORY_ARGS+=(--memory_disable_dynamic_threshold)
+ENABLE_MEMORY="${ENABLE_MEMORY:-1}"
+
+MEMORY_ARGS=()
+
+if [[ "${ENABLE_MEMORY}" == "1" ]]; then
+  MEMORY_ARGS=(
+    --enable_memory_correction
+    --memory_dir "${MEMORY_DIR}"
+    --memory_log_file "${MEMORY_LOG_FILE}"
+    --memory_weight "${MEMORY_WEIGHT}"
+    --memory_gamma "${MEMORY_GAMMA}"
+    --memory_top_k "${MEMORY_TOP_K}"ƒTER
+    --memory_threshold "${MEMORY_THRESHOLD}"
+    --memory_reward_mode terminal_only
+    --no-memory_use_env_reward_fallback
+    --memory_terminal_step_penalty "${MEMORY_TERMINAL_STEP_PENALTY}"
+    --memory_scope "${MEMORY_SCOPE}"
+  )
+
+  if [[ "${RESET_MEMORY}" == "1" ]]; then
+    MEMORY_ARGS+=(--reset_memory)
+  fi
+
+  if [[ "${DISABLE_DYNAMIC_THRESHOLD}" == "1" ]]; then
+    MEMORY_ARGS+=(--memory_disable_dynamic_threshold)
+  fi
 fi
 
-if [[ "${ENABLE_MEMORY_ACTION_AUGMENTATION}" == "1" ]]; then
+if [[
+  "${ENABLE_MEMORY}" == "1"
+  && "${ENABLE_MEMORY_ACTION_AUGMENTATION}" == "1"
+]]; then
   MEMORY_ARGS+=(
     --enable_memory_action_augmentation
     --memory_max_augmented_actions "${MEMORY_MAX_AUGMENTED_ACTIONS}"
