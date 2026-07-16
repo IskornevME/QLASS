@@ -22,10 +22,20 @@ def normalize_env_action(text: object) -> str:
     if match:
         s = match.group(1).strip()
 
-    # If model generated extra text after the action, keep only the first line.
-    s = s.splitlines()[0].strip()
+    # После извлечения Action: строка тоже может оказаться пустой.
+    if not s:
+        return ""
 
-    # Normalize harmless formatting differences.
+    # Если после action присутствует дополнительный текст,
+    # сохраняем только первую непустую строку.
+    lines = s.splitlines()
+    if not lines:
+        return ""
+
+    s = lines[0].strip()
+    if not s:
+        return ""
+
     s = s.rstrip(".")
     s = " ".join(s.lower().split())
     return s
