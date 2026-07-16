@@ -157,30 +157,60 @@ def get_step_candidates(traj: Dict[str, Any]) -> List[List[Dict[str, Any]]]:
     return [step for step in action_value_dict if isinstance(step, list)]
 
 
-def aggregate_saved_correction_stats(trajectories: Iterable[Dict[str, Any]]) -> Dict[str, Any]:
+def aggregate_saved_correction_stats(
+    trajectories: Iterable[Dict[str, Any]],
+) -> Dict[str, Any]:
     total_steps = 0
     changed_steps = 0
     num_trajs_with_stats = 0
+
+    actor_tiebreak_applied = 0
+    actor_tiebreak_changed = 0
 
     for traj in trajectories:
         stats = traj.get("q_adv_correction_stats")
         if not isinstance(stats, dict):
             continue
 
-        q_adv_steps = int(stats.get("num_q_adv_steps", 0) or 0)
-        changed = int(stats.get("num_raw_vs_selected_changed", 0) or 0)
+        selection_steps = int(
+            stats.get("num_q_adv_steps", 0) or 0
+        )
+        changed = int(
+            stats.get("num_raw_vs_selected_changed", 0) or 0
+        )
+        tiebreak_applied = int(
+            stats.get("num_actor_tiebreak_applied", 0) or 0
+        )
+        tiebreak_changed = int(
+            stats.get("num_actor_tiebreak_changed", 0) or 0
+        )
 
-        if q_adv_steps > 0:
+        if selection_steps > 0:
             num_trajs_with_stats += 1
-            total_steps += q_adv_steps
+            total_steps += selection_steps
             changed_steps += changed
+            actor_tiebreak_applied += tiebreak_applied
+            actor_tiebreak_changed += tiebreak_changed
 
     return {
         "source": "q_adv_correction_stats",
         "num_trajs_with_stats": num_trajs_with_stats,
         "num_q_adv_steps": total_steps,
         "num_raw_vs_selected_changed": changed_steps,
-        "raw_vs_selected_changed_rate": safe_div(changed_steps, total_steps),
+        "raw_vs_selected_changed_rate": safe_div(
+            changed_steps,
+            total_steps,
+        ),
+        "num_actor_tiebreak_applied": actor_tiebreak_applied,
+        "actor_tiebreak_applied_rate": safe_div(
+            actor_tiebreak_applied,
+            total_steps,
+        ),
+        "num_actor_tiebreak_changed": actor_tiebreak_changed,
+        "actor_tiebreak_changed_rate_among_applied": safe_div(
+            actor_tiebreak_changed,
+            actor_tiebreak_applied,
+        ),
     }
 
 

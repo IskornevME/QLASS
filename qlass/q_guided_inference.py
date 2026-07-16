@@ -342,6 +342,11 @@ def is_q_adv_logit_strategy(args) -> bool:
     return args.selection_strategy in {"q_adv_logit_argmax", "q_adv_logit_sample"}
 
 
+def is_q_actor_near_tie_strategy(args) -> bool:
+    """Use actor logprob only to resolve near-ties between raw QNet scores."""
+    return args.selection_strategy == "q_actor_near_tie_argmax"
+
+
 def is_dueling_adv_logit_strategy(args) -> bool:
     """New DuelingQNet advantage + actor-logprob strategy."""
     return args.selection_strategy in {
@@ -355,6 +360,14 @@ def is_corrected_logit_strategy(args) -> bool:
     return is_q_adv_logit_strategy(args) or is_dueling_adv_logit_strategy(args)
 
 
+def is_selection_correction_strategy(args) -> bool:
+    """Any strategy that may change the original raw-Q selection."""
+    return (
+        is_corrected_logit_strategy(args)
+        or is_q_actor_near_tie_strategy(args)
+    )
+
+
 def uses_legacy_qnet(args) -> bool:
     """Whether we need to load/evaluate the old scalar QNet."""
     return args.selection_strategy in {
@@ -362,6 +375,7 @@ def uses_legacy_qnet(args) -> bool:
         "q_argmax_oversample",
         "q_adv_logit_argmax",
         "q_adv_logit_sample",
+        "q_actor_near_tie_argmax",
     }
 
 
@@ -385,6 +399,7 @@ def uses_canonical_oversampled_generation(args) -> bool:
         "q_argmax_oversample",
         "dueling_adv_logit_argmax",
         "dueling_adv_logit_sample",
+        "q_actor_near_tie_argmax",
     }
 
 
@@ -880,6 +895,8 @@ def compute_and_mark_selection_diagnostics(
         "is_q_adv_logit_strategy": bool(is_q_adv_logit_strategy(args)),
         "is_dueling_adv_logit_strategy": bool(is_dueling_adv_logit_strategy(args)),
         "is_corrected_logit_strategy": bool(is_corrected_logit_strategy(args)),
+        "is_q_actor_near_tie_strategy": bool(is_q_actor_near_tie_strategy(args)),
+        "is_selection_correction_strategy": bool(is_selection_correction_strategy(args)),
         "selection_strategy": args.selection_strategy,
 
         "raw_best_idx": raw_best_idx,
@@ -891,6 +908,22 @@ def compute_and_mark_selection_diagnostics(
         "selected_corrected_score": selected_candidate.get("corrected_score"),
 
         "raw_vs_selected_changed": bool(raw_vs_selected_changed),
+
+        "q_actor_tiebreak_top_gap": selected_candidate.get(
+            "q_actor_tiebreak_top_gap"
+        ),
+        "q_actor_tiebreak_applied": bool(
+            selected_candidate.get("q_actor_tiebreak_applied", False)
+        ),
+        "q_actor_tiebreak_changed_selection": bool(
+            selected_candidate.get(
+                "q_actor_tiebreak_changed_selection",
+                False,
+            )
+        ),
+        "q_actor_terminal_override": bool(
+            selected_candidate.get("q_actor_terminal_override", False)
+        ),
     }
 
     logger.info(
@@ -935,6 +968,33 @@ def sync_action_value_dict_with_candidate_records(
         item["dueling_adv_std"] = candidate.get("dueling_adv_std")
         item["actor_logprob_used"] = candidate.get("actor_logprob_used")
         item["corrected_score"] = candidate.get("corrected_score")
+        item["q_actor_tiebreak_top_gap"] = candidate.get(
+            "q_actor_tiebreak_top_gap"
+        )
+        item["q_actor_tiebreak_gap_to_best"] = candidate.get(
+            "q_actor_tiebreak_gap_to_best"
+        )
+        item["q_actor_tiebreak_eligible"] = bool(
+            candidate.get("q_actor_tiebreak_eligible", False)
+        )
+        item["q_actor_tiebreak_applied"] = bool(
+            candidate.get("q_actor_tiebreak_applied", False)
+        )
+        item["q_actor_tiebreak_changed_selection"] = bool(
+            candidate.get(
+                "q_actor_tiebreak_changed_selection",
+                False,
+            )
+        )
+        item["q_actor_tiebreak_selected_by_actor"] = bool(
+            candidate.get(
+                "q_actor_tiebreak_selected_by_actor",
+                False,
+            )
+        )
+        item["q_actor_terminal_override"] = bool(
+            candidate.get("q_actor_terminal_override", False)
+        )
         item["selected"] = bool(candidate.get("selected", False))
         item["selected_by_raw_q"] = bool(candidate.get("selected_by_raw_q", False))
         item["selected_by_final_policy"] = bool(
@@ -986,6 +1046,155 @@ def select_candidate_raw_q_argmax(
         return selected
 
     raise NotImplementedError(f"We do not support the sample mode: {args.sample_mode}")
+
+
+def select_candidate_q_actor_near_tie(
+    candidate_records: List[Dict[str, Any]],
+    args,
+) -> Dict[str, Any]:
+    """Select by raw QNet score, using actor logprob only inside a near-tie set.
+
+    Near-tie candidates are those whose raw selection score is no more than
+    q_actor_tiebreak_threshold below the best raw QNet/env score.
+
+    A known successful terminal candidate always has priority and cannot be
+    overridden by actor likelihood.
+    """
+    if not candidate_records:
+        raise RuntimeError(
+            "[q_guided_inference] Cannot select from empty candidate_records."
+        )
+
+    if args.sample_mode != "bon":
+        raise ValueError(
+            "q_actor_near_tie_argmax currently supports only --sample_mode bon, "
+            f"got {args.sample_mode!r}."
+        )
+
+    threshold = float(args.q_actor_tiebreak_threshold)
+    if threshold < 0.0:
+        raise ValueError(
+            "--q_actor_tiebreak_threshold must be non-negative, "
+            f"got {threshold}."
+        )
+
+    ranked_by_q = sorted(
+        candidate_records,
+        key=get_candidate_raw_selection_score,
+        reverse=True,
+    )
+
+    raw_best = ranked_by_q[0]
+    raw_best_score = get_candidate_raw_selection_score(raw_best)
+
+    top_gap = None
+    if len(ranked_by_q) >= 2:
+        top_gap = (
+            raw_best_score
+            - get_candidate_raw_selection_score(ranked_by_q[1])
+        )
+
+    # Store actor scores and Q-gaps for diagnostics.
+    for candidate in candidate_records:
+        actor_logprob = get_candidate_actor_logprob(candidate, args)
+        candidate_score = get_candidate_raw_selection_score(candidate)
+        gap_to_best = max(0.0, raw_best_score - candidate_score)
+
+        candidate["actor_logprob_used"] = float(actor_logprob)
+        candidate["q_actor_tiebreak_top_gap"] = (
+            None if top_gap is None else float(top_gap)
+        )
+        candidate["q_actor_tiebreak_gap_to_best"] = float(gap_to_best)
+        candidate["q_actor_tiebreak_eligible"] = False
+        candidate["q_actor_tiebreak_applied"] = False
+        candidate["q_actor_tiebreak_changed_selection"] = False
+        candidate["q_actor_tiebreak_selected_by_actor"] = False
+        candidate["q_actor_terminal_override"] = False
+
+    # Safety: never reject a transition already known to solve the task.
+    successful_terminal_candidates = [
+        candidate
+        for candidate in candidate_records
+        if bool(candidate.get("finished"))
+        and float(candidate.get("env_reward") or 0.0) > 0.0
+    ]
+
+    if successful_terminal_candidates:
+        selected = max(
+            successful_terminal_candidates,
+            key=get_candidate_raw_selection_score,
+        )
+
+        for candidate in candidate_records:
+            candidate["q_actor_terminal_override"] = True
+
+        logger.info(
+            "[SELECT_Q_ACTOR_NEAR_TIE] successful terminal override: "
+            "selected_idx=%s action=%r raw_score=%.6f",
+            selected.get("idx"),
+            selected.get("action"),
+            get_candidate_raw_selection_score(selected),
+        )
+        return selected
+
+    # Generalized implementation: for BON > 2, actor may choose only among
+    # candidates lying within threshold of the best raw Q score.
+    eligible_candidates = [
+        candidate
+        for candidate in ranked_by_q
+        if candidate["q_actor_tiebreak_gap_to_best"] <= threshold
+    ]
+
+    eligible_indices = {
+        candidate.get("idx")
+        for candidate in eligible_candidates
+    }
+
+    tiebreak_applied = len(eligible_candidates) >= 2
+
+    if tiebreak_applied:
+        selected = max(
+            eligible_candidates,
+            key=lambda candidate: float(candidate["actor_logprob_used"]),
+        )
+    else:
+        selected = raw_best
+
+    selection_changed = selected.get("idx") != raw_best.get("idx")
+
+    for candidate in candidate_records:
+        candidate["q_actor_tiebreak_eligible"] = (
+            candidate.get("idx") in eligible_indices
+        )
+        candidate["q_actor_tiebreak_applied"] = bool(tiebreak_applied)
+        candidate["q_actor_tiebreak_changed_selection"] = bool(selection_changed)
+        candidate["q_actor_tiebreak_selected_by_actor"] = bool(
+            tiebreak_applied
+            and candidate.get("idx") == selected.get("idx")
+        )
+
+    logger.info(
+        "[SELECT_Q_ACTOR_NEAR_TIE] threshold=%.6f top_gap=%s "
+        "eligible=%d/%d applied=%s changed=%s "
+        "raw_idx=%s raw_action=%r raw_score=%.6f "
+        "selected_idx=%s selected_action=%r selected_raw_score=%.6f "
+        "selected_actor_logprob=%.6f",
+        threshold,
+        None if top_gap is None else round(float(top_gap), 8),
+        len(eligible_candidates),
+        len(candidate_records),
+        tiebreak_applied,
+        selection_changed,
+        raw_best.get("idx"),
+        raw_best.get("action"),
+        raw_best_score,
+        selected.get("idx"),
+        selected.get("action"),
+        get_candidate_raw_selection_score(selected),
+        float(selected["actor_logprob_used"]),
+    )
+
+    return selected
 
 
 def log_candidate_records(
@@ -1097,6 +1306,8 @@ def main(args):
     global_correction_stats = {
         "num_q_adv_steps": 0,
         "num_raw_vs_selected_changed": 0,
+        "num_actor_tiebreak_applied": 0,
+        "num_actor_tiebreak_changed": 0,
     }
 
     qnet = None
@@ -1286,6 +1497,10 @@ def main(args):
                     "num_q_adv_steps": 0,
                     "num_raw_vs_selected_changed": 0,
                     "raw_vs_selected_changed_rate": 0.0,
+                    "num_actor_tiebreak_applied": 0,
+                    "num_actor_tiebreak_changed": 0,
+                    "actor_tiebreak_applied_rate": 0.0,
+                    "actor_tiebreak_changed_rate_among_applied": 0.0,
                 }
                 # for n_turn in range(turn_cap):
                 for n_turn in range(env.max_steps):
@@ -1565,7 +1780,9 @@ def main(args):
                     # ------------------------------------------------------------------
                     if is_dueling_adv_logit_strategy(args):
                         if dueling_qnet is None or dueling_tokenizer is None:
-                            raise RuntimeError("Dueling strategy selected, but dueling_qnet/tokenizer is not loaded.")
+                            raise RuntimeError(
+                                "Dueling strategy selected, but dueling_qnet/tokenizer is not loaded."
+                            )
 
                         evaluate_candidates_dueling_qnet(
                             model=dueling_qnet,
@@ -1574,14 +1791,32 @@ def main(args):
                             candidate_records=candidate_records,
                             args=args,
                         )
-                        selected_candidate = select_candidate_q_adv_logit(candidate_records, args)
+                        selected_candidate = select_candidate_q_adv_logit(
+                            candidate_records,
+                            args,
+                        )
 
                     elif is_q_adv_logit_strategy(args):
-                        compute_q_advantage_and_corrected_scores(candidate_records, args)
-                        selected_candidate = select_candidate_q_adv_logit(candidate_records, args)
+                        compute_q_advantage_and_corrected_scores(
+                            candidate_records,
+                            args,
+                        )
+                        selected_candidate = select_candidate_q_adv_logit(
+                            candidate_records,
+                            args,
+                        )
+
+                    elif is_q_actor_near_tie_strategy(args):
+                        selected_candidate = select_candidate_q_actor_near_tie(
+                            candidate_records,
+                            args,
+                        )
 
                     else:
-                        selected_candidate = select_candidate_raw_q_argmax(candidate_records, args)
+                        selected_candidate = select_candidate_raw_q_argmax(
+                            candidate_records,
+                            args,
+                        )
 
                     selected_candidate["selected"] = True
 
@@ -1595,13 +1830,21 @@ def main(args):
                     selection_diagnostics["traj_id"] = traj_id
                     step_selection_diagnostics_list.append(selection_diagnostics)
 
-                    if selection_diagnostics["is_corrected_logit_strategy"]:
+                    if selection_diagnostics["is_selection_correction_strategy"]:
                         traj_correction_stats["num_q_adv_steps"] += 1
                         global_correction_stats["num_q_adv_steps"] += 1
 
                         if selection_diagnostics["raw_vs_selected_changed"]:
                             traj_correction_stats["num_raw_vs_selected_changed"] += 1
                             global_correction_stats["num_raw_vs_selected_changed"] += 1
+
+                        if selection_diagnostics["q_actor_tiebreak_applied"]:
+                            traj_correction_stats["num_actor_tiebreak_applied"] += 1
+                            global_correction_stats["num_actor_tiebreak_applied"] += 1
+
+                        if selection_diagnostics["q_actor_tiebreak_changed_selection"]:
+                            traj_correction_stats["num_actor_tiebreak_changed"] += 1
+                            global_correction_stats["num_actor_tiebreak_changed"] += 1
 
                     # Sync computed fields and selected flag into JSON-serializable logs.
                     sync_action_value_dict_with_candidate_records(
@@ -1670,6 +1913,17 @@ def main(args):
                     traj_correction_stats["num_raw_vs_selected_changed"],
                     traj_correction_stats["num_q_adv_steps"],
                 )
+                traj_correction_stats["actor_tiebreak_applied_rate"] = safe_rate(
+                    traj_correction_stats["num_actor_tiebreak_applied"],
+                    traj_correction_stats["num_q_adv_steps"],
+                )
+
+                traj_correction_stats[
+                    "actor_tiebreak_changed_rate_among_applied"
+                ] = safe_rate(
+                    traj_correction_stats["num_actor_tiebreak_changed"],
+                    traj_correction_stats["num_actor_tiebreak_applied"],
+                )
                 logger.info(
                     "[TRAJ_CORRECTION_STATS] task=%s traj=%d strategy=%s "
                     "q_adv_steps=%d raw_vs_selected_changed=%d rate=%.4f ",
@@ -1733,6 +1987,17 @@ def main(args):
     global_correction_stats["raw_vs_selected_changed_rate"] = safe_rate(
         global_correction_stats["num_raw_vs_selected_changed"],
         global_correction_stats["num_q_adv_steps"],
+    )
+    global_correction_stats["actor_tiebreak_applied_rate"] = safe_rate(
+        global_correction_stats["num_actor_tiebreak_applied"],
+        global_correction_stats["num_q_adv_steps"],
+    )
+
+    global_correction_stats[
+        "actor_tiebreak_changed_rate_among_applied"
+    ] = safe_rate(
+        global_correction_stats["num_actor_tiebreak_changed"],
+        global_correction_stats["num_actor_tiebreak_applied"],
     )
 
     global_stats_msg = (
@@ -1955,6 +2220,7 @@ if __name__ == "__main__":
             "q_argmax_oversample",
             "q_adv_logit_argmax",
             "q_adv_logit_sample",
+            "q_actor_near_tie_argmax",
             "dueling_adv_logit_argmax",
             "dueling_adv_logit_sample",
         ],
@@ -1976,6 +2242,15 @@ if __name__ == "__main__":
         type=float,
         default=1.0,
         help="Weight for actor action-level logprob in corrected-score selection.",
+    )
+    parser.add_argument(
+        "--q_actor_tiebreak_threshold",
+        type=float,
+        default=0.005,
+        help=(
+            "Maximum raw Q-score gap from the best candidate for actor-logprob "
+            "near-tie selection. Used only by q_actor_near_tie_argmax."
+        ),
     )
     parser.add_argument(
         "--q_adv_eps",
@@ -2084,6 +2359,11 @@ if __name__ == "__main__":
             logger.warning(
                 "[q_guided_inference] dueling_adv_logit usually works best with --actor_logprob_type mean because action lengths can differ."
             )
+    if args.q_actor_tiebreak_threshold < 0.0:
+        raise ValueError(
+            "--q_actor_tiebreak_threshold must be non-negative, "
+            f"got {args.q_actor_tiebreak_threshold}"
+        )
 
     if args.verbose:
         logger.setLevel(logging.INFO)

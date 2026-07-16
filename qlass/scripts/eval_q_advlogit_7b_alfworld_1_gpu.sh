@@ -123,6 +123,7 @@ fi
 
 if [[ "${SELECTION_STRATEGY}" == "q_argmax" \
    || "${SELECTION_STRATEGY}" == "q_argmax_oversample" \
+   || "${SELECTION_STRATEGY}" == "q_actor_near_tie_argmax" \
    || "${SELECTION_STRATEGY}" == q_adv_logit_* ]]; then
 
   if [[ -z "${QNET_PATH}" ]]; then
@@ -146,6 +147,7 @@ ACTOR_LOGPROB_COEF=${ACTOR_LOGPROB_COEF:-0.0}
 Q_ADV_BETA=${Q_ADV_BETA:-1.0}
 Q_ADV_EPS=${Q_ADV_EPS:-1e-6}
 Q_ADV_CLIP=${Q_ADV_CLIP:-5.0}
+Q_ACTOR_TIEBREAK_THRESHOLD=${Q_ACTOR_TIEBREAK_THRESHOLD:-0.005}
 
 # Candidate generation with one canonical prompt:
 # raw samples per round = BON * CANDIDATE_OVERSAMPLE_FACTOR
@@ -155,7 +157,13 @@ CANDIDATE_MAX_ROUNDS=${CANDIDATE_MAX_ROUNDS:-1}
 slice_num="${NUM_WORKERS}"
 slice_id=0
 
-OUT_DIR="data/train/${task}/${explore_model_name}/dueling_adv/${data_prefix}_${SELECTION_STRATEGY}_bon${BON}_beta${Q_ADV_BETA}_actor${ACTOR_LOGPROB_COEF}_${ACTOR_LOGPROB_TYPE}_oversample${CANDIDATE_OVERSAMPLE_FACTOR}x${CANDIDATE_MAX_ROUNDS}_workers${NUM_WORKERS}_ntrajs${N_TRAJS}_${SPLT}_run_${RUN_ID}/"
+TIEBREAK_TAG=""
+
+if [[ "${SELECTION_STRATEGY}" == "q_actor_near_tie_argmax" ]]; then
+  TIEBREAK_TAG="_tiegap${Q_ACTOR_TIEBREAK_THRESHOLD}"
+fi
+
+OUT_DIR="data/train/${task}/${explore_model_name}/dueling_adv/${data_prefix}_${SELECTION_STRATEGY}_bon${BON}_beta${Q_ADV_BETA}_actor${ACTOR_LOGPROB_COEF}_${ACTOR_LOGPROB_TYPE}${TIEBREAK_TAG}_oversample${CANDIDATE_OVERSAMPLE_FACTOR}x${CANDIDATE_MAX_ROUNDS}_workers${NUM_WORKERS}_ntrajs${N_TRAJS}_${SPLT}_run_${RUN_ID}/"
 mkdir -p "${OUT_DIR}"
 
 RUN_LOG="${OUT_DIR}/q_guided_inference.log"
@@ -196,6 +204,7 @@ for slice_id in $(seq 0 $((NUM_WORKERS - 1))); do
       --best_of_N "${BON}" \
       --actor_logprob_type "${ACTOR_LOGPROB_TYPE}" \
       --actor_logprob_coef "${ACTOR_LOGPROB_COEF}" \
+      --q_actor_tiebreak_threshold "${Q_ACTOR_TIEBREAK_THRESHOLD}" \
       --q_adv_beta "${Q_ADV_BETA}" \
       --q_adv_eps "${Q_ADV_EPS}" \
       --q_adv_clip "${Q_ADV_CLIP}" \
