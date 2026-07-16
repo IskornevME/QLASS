@@ -4,10 +4,10 @@ import os
 
 data_dir = './data/train/alfworld/'
 model_name = 'qlass-Llama-2-7b-chat-hf-alfworld-sft'
-# inference_type = 'q_correction_memory_without_perturb'
-inference_type = 'q_without_perturb'
-# eval_name = 'debug_bon2_test_run_aug_only_0_lambda0.0_gamma0.97_k10_thr0.75_global_no_terminal_override_aug2_percanon1_retrieved_thought_exact_only'
-eval_name = 'debug_bon2_test_run_0'
+inference_type = 'q_correction_memory_without_perturb'
+# inference_type = 'q_without_perturb'
+eval_name = 'debug_bon2_test_run_qlass_control_no_memory_lambda0.0_gamma0.97_k10_thr0.75_global_no_terminal_override_no_aug'
+# eval_name = 'debug_bon2_test_run_0'
 slice_num = 1
 file_list = []
 for i in range(slice_num):

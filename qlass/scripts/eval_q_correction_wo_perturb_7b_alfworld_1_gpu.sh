@@ -89,7 +89,7 @@ if [[ "${ENABLE_MEMORY}" == "1" ]]; then
     --memory_log_file "${MEMORY_LOG_FILE}"
     --memory_weight "${MEMORY_WEIGHT}"
     --memory_gamma "${MEMORY_GAMMA}"
-    --memory_top_k "${MEMORY_TOP_K}"ƒTER
+    --memory_top_k "${MEMORY_TOP_K}"
     --memory_threshold "${MEMORY_THRESHOLD}"
     --memory_reward_mode terminal_only
     --no-memory_use_env_reward_fallback
