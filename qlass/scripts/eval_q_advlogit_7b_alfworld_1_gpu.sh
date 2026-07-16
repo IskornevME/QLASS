@@ -9,6 +9,7 @@ model_path=${MODEL_PATH} # path to the original LLM
 save_dir=${MODEL_PATH}    # checkpoint save path
 
 QNET_STEP=14382
+QNET_PATH=${QNET_PATH:-}
 # sft_model_name=${exp_name}-${model_name}-${task}-sft_run1
 sft_model_name=${exp_name}-${model_name}-${task}-sft_run1
 
@@ -120,6 +121,26 @@ if [[ "${SELECTION_STRATEGY}" == dueling_adv_logit_* ]]; then
   fi
 fi
 
+if [[ "${SELECTION_STRATEGY}" == "q_argmax" \
+   || "${SELECTION_STRATEGY}" == "q_argmax_oversample" \
+   || "${SELECTION_STRATEGY}" == q_adv_logit_* ]]; then
+
+  if [[ -z "${QNET_PATH}" ]]; then
+    echo "[ERROR] QNET_PATH must be provided for ${SELECTION_STRATEGY}"
+    exit 1
+  fi
+
+  if [[ ! -f "${QNET_PATH}/pytorch_model.bin" ]]; then
+    echo "[ERROR] Missing QNet weights: ${QNET_PATH}/pytorch_model.bin"
+    exit 1
+  fi
+
+  if [[ ! -f "${QNET_PATH}/config.json" ]]; then
+    echo "[ERROR] Missing QNet config: ${QNET_PATH}/config.json"
+    exit 1
+  fi
+fi
+
 ACTOR_LOGPROB_TYPE=mean
 ACTOR_LOGPROB_COEF=${ACTOR_LOGPROB_COEF:-0.0}
 Q_ADV_BETA=${Q_ADV_BETA:-1.0}
@@ -153,6 +174,7 @@ for slice_id in $(seq 0 $((NUM_WORKERS - 1))); do
     CUDA_VISIBLE_DEVICES="${worker_gpu}" python qlass/q_guided_inference.py \
       --agent_config "${agent_cfg}" \
       --agent_path qlass/configs/model/ \
+      --qnet_path "${QNET_PATH}" \
       --dueling_qnet_path "${DUELING_QNET_PATH}" \
       --dueling_tokenizer_path "${DUELING_QNET_PATH}" \
       --dueling_prompt_model_name "${DUELING_PROMPT_MODEL_NAME}" \
