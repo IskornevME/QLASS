@@ -20,6 +20,17 @@ class BaseEnv(ABC):
         self.icl_format = icl_format
         self.max_steps = max_steps
 
+    def get_task_text(self) -> str:
+        return ""
+
+    def get_current_observation(self) -> str:
+        return ""
+
+    def get_inventory(self) -> str:
+        return ""
+
+    def get_admissible_commands(self) -> list[str]:
+        return []
 
     @abstractmethod
     def step(self, llm_output: str) -> Tuple[str, State]:

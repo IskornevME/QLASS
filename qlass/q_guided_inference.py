@@ -318,21 +318,9 @@ def verify_conversations(conversations):
 # RECURSIVE_MODE = True
 # N_SFT_EXAMPLES = 1000
 
-MAX_TURNS={"webshop":5,"sciworld":40,"alfworld":40}
-N_SAMPLE = 3
-# N_TRAJS = 3
-EPSILON = 0.1
-TOPK = 2
 
-
-def _force_min_max_steps(env, min_steps: int):
-    """SciWorld reset can overwrite env.max_steps (e.g. from max_steps.json). Force it back."""
-    cur = getattr(env, "max_steps", None)
-    if cur is None:
-        env.max_steps = int(min_steps)
-    else:
-        env.max_steps = int(max(int(cur), int(min_steps)))
-
+def _set_max_steps(env: Any, max_steps: int) -> None:
+    env.max_steps = int(max_steps)
 
 
 def _append_jsonl_record(path: Optional[str], record: Mapping[str, Any]) -> None:
@@ -371,11 +359,24 @@ def _extract_assistant_action_msgs(history: Sequence[Mapping[str, Any]]) -> List
     return actions
 
 
+def _get_task_text(
+    env: Any,
+    task: Any,
+) -> str:
+    env_task_text = str(env.get_task_text()).strip()
+
+    if env_task_text:
+        return env_task_text
+
+    return str(getattr(task, "observation", "")).strip()
+
+
 def _extract_observation_for_memory(
     history: Sequence[Mapping[str, Any]],
     *,
     task_text: str,
     step_index: int,
+    initial_observation="",
 ) -> str:
     """Return the observation of the state before the selected action.
 
@@ -384,7 +385,10 @@ def _extract_observation_for_memory(
     demonstration text instead of the current task.
     """
     if step_index == 0:
-        return str(task_text).strip()
+        return (
+            str(initial_observation).strip()
+            or str(task_text).strip()
+        )
 
     for message in reversed(history):
         if message.get("role") != "user":
@@ -500,7 +504,10 @@ def main(args):
     total_trees = []
     successful_trajs = []
     token_count = 0
-    
+
+    if args.max_steps is not None and args.max_steps <= 0:
+        raise ValueError("--max_steps must be a positive integer.")
+
     args.model_name_or_path = args.qnet_path
     args.low_cpu_mem_usage = False
     args.use_flash_attn = True
@@ -522,6 +529,9 @@ def main(args):
     with open(os.path.join(args.agent_path, f"{args.agent_config}.json")) as f:
         agent_config: Dict[str, Any] = json.load(f)
     tokenizer_path = args.tokenizer_path or agent_config.get("config", {}).get("tokenizer_path") or args.model_name
+    if tokenizer_path is not None:
+        agent_config["config"]["tokenizer_path"] = tokenizer_path
+
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, model_max_length=4096, use_fast=False)
     if tokenizer.pad_token != tokenizer.unk_token:
         tokenizer.pad_token = tokenizer.unk_token
@@ -536,12 +546,35 @@ def main(args):
         agent_config['config']['model_name'] = args.model_name
         agent_config['config']['batch_size'] = args.eval_batch_size
 
+    agent_config["config"].update(
+        {
+            "max_prompt_tokens": (
+                args.policy_max_prompt_tokens
+            ),
+            "keep_first_n": (
+                args.policy_keep_first_n
+            ),
+            "min_tail_msgs": (
+                args.policy_min_tail_msgs
+            ),
+        }
+    )
+
     # Attach QNet trimming caps to the model instance (used inside evaluate_trajs_qnet_v2)
     qnet._qnet_max_prompt_tokens = args.qnet_max_prompt_tokens
     qnet._qnet_keep_first_n = args.qnet_keep_first_n
     qnet._qnet_min_tail_msgs = args.qnet_min_tail_msgs
         
     env_config = exp_config["env_config"]
+    if args.max_steps is not None:
+        env_config["max_steps"] = int(args.max_steps)
+
+    if "max_steps" not in env_config:
+        raise ValueError(
+            f"max_steps is not configured for benchmark={args.exp_config!r}"
+        )
+
+    turn_cap = int(env_config["max_steps"])
     logger.info(f"Experiment config: \n{json.dumps(exp_config, indent=2)}")
     
     if env_config['env_class'] == 'WebShopEnv':
@@ -551,7 +584,7 @@ def main(args):
         from scienceworld import ScienceWorldEnv
         from eval_agent.utils.replace_sciworld_score import sciworld_monkey_patch
         sciworld_monkey_patch()
-        env_config['env'] = ScienceWorldEnv("", serverPath=os.path.join(os.getcwd(), env_config['env_jar_path']), envStepLimit=200)
+        env_config['env'] = ScienceWorldEnv("", serverPath=os.path.join(os.getcwd(), env_config['env_jar_path']), envStepLimit=turn_cap + 1)
 
     # initialize all the tasks
     task_config: Dict[str, Any] = exp_config["task"]
@@ -574,11 +607,15 @@ def main(args):
     correction_memory = None
     memory_log_file: Optional[str] = None
     if args.enable_memory_correction:
-        if args.exp_config != "alfworld":
+        if args.exp_config not in {
+            "alfworld",
+            "sciworld",
+        }:
             raise ValueError(
-                "Memory correction currently supports only --exp_config alfworld."
+                "Memory currently supports only "
+                "alfworld and sciworld."
             )
-        if args.memory_reward_mode != "terminal_only":
+        if args.memory_reward_mode not in ["terminal_only", "final_score"]:
             raise ValueError(
                 "The initial correction variant supports only terminal_only rewards."
             )
@@ -593,10 +630,11 @@ def main(args):
         from qlass.alfworld_correction_memory import AlfWorldCorrectionMemory
 
         memory_dir = args.memory_dir or os.path.join(
-            args.output_dir, "alfworld_correction_memory"
+            args.output_dir, f"{args.exp_config}_episodic_memory"
         )
         correction_memory = AlfWorldCorrectionMemory(
             base_dir=memory_dir,
+            benchmark=args.exp_config,
             gamma=args.memory_gamma,
             top_k=args.memory_top_k,
             similarity_threshold=args.memory_threshold,
@@ -652,8 +690,6 @@ def main(args):
             args.memory_scope,
             correction_memory.stats(),
         )
-    
-    turn_cap = MAX_TURNS[args.exp_config]   # for sciworld => 40
 
     done_task_id = []
     mult_success_num = 0
@@ -671,6 +707,12 @@ def main(args):
     with logging_redirect_tqdm():
         pbar = tqdm(total=n_tasks)
         for i, task in enumerate(all_tasks):
+            if (
+                args.max_tasks is not None
+                and i >= args.max_tasks
+            ):
+                break
+
             if args.debug and i==2:
                 break
             
@@ -695,7 +737,7 @@ def main(args):
                 f"MAX_TURNS={MAX_TURNS.get(args.exp_config, None)}"
             )
 
-            _force_min_max_steps(env, turn_cap)
+            _set_max_steps(env, turn_cap)
 
             print(f"[DBG_MAX_STEPS] AFTER override: env.max_steps={getattr(env, 'max_steps', None)}")
 
@@ -708,7 +750,7 @@ def main(args):
                 start_i = 2
 
             init_msg, state = env.reset(num_icl_examples=args.num_icl_examples)
-            _force_min_max_steps(env, turn_cap)
+            _set_max_steps(env, turn_cap)
             print(f"[DBG_MAX_STEPS] AFTER reset#0 (forced): env.max_steps={getattr(env,'max_steps',None)}")
 
             root = TreeNode(state=init_msg, action='No Action (Root)', reward=state.reward) 
@@ -731,7 +773,7 @@ def main(args):
                 init_msg, cur_traj_state = env.reset(
                     num_icl_examples=args.num_icl_examples
                 )
-                _force_min_max_steps(env, turn_cap)
+                _set_max_steps(env, turn_cap)
                 print(
                     f"[DBG_MAX_STEPS] AFTER reset(traj{traj_id}) (forced): "
                     f"env.max_steps={getattr(env, 'max_steps', None)}"
@@ -757,11 +799,14 @@ def main(args):
 
                     # Construct one memory query for the current pre-action
                     # state. It is shared by all candidate actions below.
-                    task_text = str(getattr(task, "observation", "")).strip()
+                    task_text = _get_task_text(env, task)
                     observation_before_action = _extract_observation_for_memory(
                         cur_traj_state.history,
                         task_text=task_text,
                         step_index=n_turn,
+                        initial_observation=(
+                            env.get_current_observation()
+                        ),
                     )
                     previous_action_commands = [
                         step["action_command"] for step in executed_steps
@@ -777,7 +822,7 @@ def main(args):
                         observation, state = env.reset(
                             num_icl_examples=args.num_icl_examples
                         )
-                        _force_min_max_steps(env, turn_cap)
+                        _set_max_steps(env, turn_cap)
 
                         if n_turn > 0:
                             prefix_actions = _extract_assistant_action_msgs(
@@ -942,7 +987,7 @@ def main(args):
 
                             # Replay to the current pre-action state, exactly as for policy candidates.
                             observation, state = env.reset(num_icl_examples=args.num_icl_examples)
-                            _force_min_max_steps(env, turn_cap)
+                            _set_max_steps(env, turn_cap)
 
                             if n_turn > 0:
                                 prefix_actions = _extract_assistant_action_msgs(
@@ -1021,7 +1066,6 @@ def main(args):
                     # Retrieval is performed once for the pre-action state.
                     # The memory class returns neutral advantages for actions
                     # without support and never introduces new actions.
-                    trajectory_final_reward = _safe_float(cur_traj_state.reward)
                     memory_result: Optional[Dict[str, Any]] = None
                     if correction_memory is not None:
                         memory_result = correction_memory.score_candidates(
@@ -1356,6 +1400,9 @@ def main(args):
 
                 memory_update: Optional[Dict[str, Any]] = None
                 if correction_memory is not None:
+                    trajectory_final_reward = _safe_float(
+                        cur_traj_state.reward
+                    )
                     memory_update = correction_memory.add_episode(
                         executed_steps=executed_steps,
                         success=bool(cur_traj_state.success),
@@ -1543,6 +1590,14 @@ if __name__ == "__main__":
     parser.add_argument("--eval_batch_size", type=int, default=1, help="batch size for evaluation.")
     parser.add_argument("--n_trajs", type=int, default=1, help="number of workers for evaluation.")
     parser.add_argument(
+        "--max_steps",
+        type=int,
+        default=None,
+        help=(
+            "Exact maximum number of agent actions per trajectory. If omitted, env_config.max_steps is used."
+        ),
+    )
+    parser.add_argument(
         "--exp_name",
         type=str,
         default="",
@@ -1555,10 +1610,15 @@ if __name__ == "__main__":
         help="Config path of experiment.",
     )
     parser.add_argument(
+        "--benchmark",
         "--exp_config",
+        dest="exp_config",
         type=str,
-        default="webshop",
-        help="Config of experiment.",
+        choices=["alfworld", "sciworld", "webshop"],
+        default="alfworld",
+        help=(
+            "Benchmark name. --exp_config is retained as a backward-compatible alias."
+        ),
     )
     parser.add_argument(
         "--split",
@@ -1604,6 +1664,11 @@ if __name__ == "__main__":
         "--debug",
         action="store_true",
         help="Whether to run in debug mode (10 ex per task).",
+    )
+    parser.add_argument(
+        "--max_tasks",
+        type=int,
+        default=None,
     )
     parser.add_argument(
         "--force_first",
@@ -1665,6 +1730,22 @@ if __name__ == "__main__":
                         help="Keep first N messages when trimming for QNet scoring.")
     parser.add_argument("--qnet_min_tail_msgs", type=int, default=4,
                         help="Keep at least this many last messages when trimming for QNet scoring.")
+
+    parser.add_argument(
+        "--policy_max_prompt_tokens",
+        type=int,
+        default=3800,
+    )
+    parser.add_argument(
+        "--policy_keep_first_n",
+        type=int,
+        default=3,
+    )
+    parser.add_argument(
+        "--policy_min_tail_msgs",
+        type=int,
+        default=4,
+    )
 
     # --- Added: JitRL-style ALFWorld memory correction of existing QLASS candidates ---
     parser.add_argument(
@@ -1731,7 +1812,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--memory_reward_mode",
         type=str,
-        choices=["terminal_only"],
+        choices=["terminal_only", "final_score"],
         default="terminal_only",
         help="Only terminal_only is implemented in the initial correction variant.",
     )

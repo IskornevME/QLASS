@@ -32,6 +32,9 @@ class SGLangAgent(LMAgent):
         # Optional prompt trimming (disabled by default)
         self.max_prompt_tokens = config.get("max_prompt_tokens", None)  # e.g. 3800
         self.keep_first_n = int(config.get("keep_first_n", 3))  # keep first 3 messages by default
+        self.min_tail_msgs = int(
+            config.get("min_tail_msgs", 4)
+        )
         self.tokenizer_path = config.get("tokenizer_path", None)  # optional explicit path
         self._tokenizer = None
 
@@ -87,34 +90,44 @@ class SGLangAgent(LMAgent):
 
         before = n_tokens
         removed = 0
-        # Remove oldest messages until it fits (one-by-one to be safe)
-        while rest and n_tokens > self.max_prompt_tokens:
-            rest.pop(0)
-            removed += 1
-            prompt = self._build_prompt(chat, prefix + rest)
-            n_tokens = len(tok(prompt, add_special_tokens=True).input_ids)
 
-        if removed > 0:
-            # logger.warning(
-            #     f"[SGLangAgent] Prompt trimmed: {before} -> {n_tokens} tokens "
-            #     f"(removed {removed} msgs, kept_first_n={keep_n})"
-            # )
+        while (
+            n_tokens > self.max_prompt_tokens
+            and len(rest) > self.min_tail_msgs
+        ):
+            removable = (
+                len(rest) - self.min_tail_msgs
+            )
 
-            self._trim_calls += 1
-            self._trim_tokens_before_sum += before
-            self._trim_tokens_after_sum += n_tokens
-            self._trim_removed_msgs_sum += removed
+            # Remove a complete assistant/user turn
+            # whenever possible.
+            remove_n = 2 if removable >= 2 else 1
 
-            # периодический лог каждые trim_log_every вызовов агента
-            if self._trim_log_every > 0 and (self._trim_total_calls % self._trim_log_every == 0):
-                ratio = self._trim_calls / max(1, self._trim_total_calls)
-                logger.warning(
-                    f"[TRIM_STATS] pid={os.getpid()} total_calls={self._trim_total_calls} "
-                    f"trim_calls={self._trim_calls} ratio={ratio:.3f} "
-                    f"avg_before={self._trim_tokens_before_sum/max(1,self._trim_calls):.1f} "
-                    f"avg_after={self._trim_tokens_after_sum/max(1,self._trim_calls):.1f} "
-                    f"avg_removed_msgs={self._trim_removed_msgs_sum/max(1,self._trim_calls):.2f}"
-                )
+            rest = rest[remove_n:]
+            removed += remove_n
+
+            prompt = self._build_prompt(
+                chat,
+                prefix + rest,
+            )
+            n_tokens = len(
+                tok(
+                    prompt,
+                    add_special_tokens=True,
+                ).input_ids
+            )
+
+        if n_tokens > self.max_prompt_tokens:
+            logger.warning(
+                "[TRIM_INCOMPLETE] prompt still exceeds "
+                "the configured policy limit: "
+                "%d > %d; prefix=%d, tail=%d",
+                n_tokens,
+                self.max_prompt_tokens,
+                len(prefix),
+                len(rest),
+            )
+
         return prefix + rest
 
 

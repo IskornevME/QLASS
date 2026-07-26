@@ -117,8 +117,15 @@ class AlfWorldCorrectionMemory:
         threshold_decay: float = 0.1,
         threshold_decay_horizon: int = 20,
         persist: bool = True,
+        benchmark: str = "alfworld",
     ) -> None:
         """Initialize memory and load previously stored records, if any."""
+        if benchmark not in {"alfworld", "sciworld"}:
+            raise ValueError(
+                f"Unsupported memory benchmark: {benchmark!r}"
+            )
+
+        self.benchmark = benchmark
 
         self.base_dir = base_dir
         self.gamma = self._validate_probability("gamma", gamma)
@@ -220,6 +227,7 @@ class AlfWorldCorrectionMemory:
             "similarity_threshold": self.similarity_threshold,
             "dynamic_threshold": self.dynamic_threshold,
             "terminal_step_penalty": self.terminal_step_penalty,
+            "benchmark": self.benchmark,
         }
 
     def clear(self, *, delete_files: bool = True) -> None:
@@ -826,6 +834,35 @@ class AlfWorldCorrectionMemory:
 
         return rewards
 
+    # ПОКА НИКАК НЕ ИСПОЛЬЗУЕТСЯ
+    # TODO: ВСТРОИТЬ
+    def _episode_rewards(
+        self,
+        *,
+        num_steps: int,
+        success: bool,
+        final_reward: float,
+    ) -> list[float]:
+        rewards = [0.0] * num_steps
+
+        if not rewards:
+            return rewards
+
+        if self.reward_mode == "terminal_only":
+            terminal_value = (
+                1.0 if success else 0.0
+            )
+        elif self.reward_mode == "final_score":
+            terminal_value = max(
+                0.0,
+                min(1.0, float(final_reward)),
+            )
+        else:
+            raise ValueError(...)
+
+        rewards[-1] = terminal_value
+        return rewards
+
     def compute_discounted_return(
         self,
         future_rewards: Sequence[float],
@@ -1024,20 +1061,32 @@ class AlfWorldCorrectionMemory:
         text = "" if action is None else str(action)
         return re.sub(r"\s+", " ", text.strip().lower())
 
-    @classmethod
-    def canonicalize_action(cls, action: Any) -> str:
-        """Canonicalize ALFWorld action by removing object instance ids.
 
-        Examples:
-            take apple 1 from countertop 2
-            -> take apple <id> from countertop <id>
-
-            put lettuce 2 in fridge 1
-            -> put lettuce <id> in fridge <id>
+    def canonicalize_action(
+        self,
+        action: Any,
+    ) -> str:
         """
-        normalized = cls.normalize_action(action)
+        ACTION CANONIZATION FOR ALFWORLD AND SCIWORLD
+
+        Canonicalize ALFWorld action by removing object instance ids.
+            
+            Examples:
+                take apple 1 from countertop 2
+                -> take apple <id> from countertop <id>
+
+                put lettuce 2 in fridge 1
+                -> put lettuce <id> in fridge <id>
+
+        For Sciworld - naive exact normalization
+        """
+        normalized = self.normalize_action(action)
+
         if not normalized:
             return ""
+
+        if self.benchmark == "sciworld":
+            return normalized
 
         tokens = normalized.split()
         canonical_tokens = [

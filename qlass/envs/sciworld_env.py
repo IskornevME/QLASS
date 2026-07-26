@@ -24,9 +24,7 @@ class SciWorldEnv(BaseEnv):
     ):
         # Keep a copy of max_steps from config (e.g. sciworld.json has max_steps=40)
         cfg_max_steps = kwargs.get("max_steps", None)
-        # Optional extra cap: allow overriding for paper setups (e.g. explore=18, eval=40)
-        paper_max_steps_cap = kwargs.pop("paper_max_steps_cap", None)
-    
+
         super().__init__(**kwargs)
         self.task: SciWorldTask = task
         self.env = env
@@ -36,10 +34,30 @@ class SciWorldEnv(BaseEnv):
         self._cfg_max_steps = int(cfg_max_steps) if cfg_max_steps is not None else None
         
         self.state = State()
-    
+
+        self.current_task_text = ""
+        self.current_observation = ""
+        self.current_inventory = ""
+        self.current_admissible_commands = []
+
+    def get_task_text(self) -> str:
+        return self.current_task_text
+
+    def get_current_observation(self) -> str:
+        return self.current_observation
+
+    def get_inventory(self) -> str:
+        return self.current_inventory
+
+    def get_admissible_commands(self) -> list[str]:
+        return list(self.current_admissible_commands)
+
     def parse_action(self, llm_output: str) -> str:
         llm_output = llm_output.strip()
-        pattern = re.compile(r"Action: (.*)", re.DOTALL)
+        pattern = re.compile(
+            r"Action:\s*(.*)",
+            re.IGNORECASE | re.DOTALL,
+        )
         action = re.findall(pattern, llm_output)[0]
         assert action is not None
         return action
@@ -68,7 +86,16 @@ class SciWorldEnv(BaseEnv):
         try:
             observation, _, done, info = self.env.step(action)
             reward = info['raw_score']
-            # print("scienceworld reward at this step: ", reward)
+
+            self.current_observation = str(observation).strip()
+            self.current_inventory = str(
+                info.get("inv", "")
+            ).strip()
+
+            self.current_admissible_commands = list(
+                self.env.get_valid_action_object_combinations()
+            )
+
             observation = f"Observation: {observation}"
             if self.state.reward is None or reward > self.state.reward:
                 self.state.reward = reward
@@ -91,10 +118,17 @@ class SciWorldEnv(BaseEnv):
             # self.state.reward = 0
 
         if done:
+            task_completed = bool(
+                info.get("task_completed", False)
+            )
+
             self.state.finished = True
-            self.state.success = True
-            self.state.terminate_reason = "success"
-            # self.state.reward = reward
+            self.state.success = task_completed
+            self.state.terminate_reason = (
+                "success"
+                if task_completed
+                else "environment_done"
+            )
 
         return observation, self.state
     
@@ -102,21 +136,31 @@ class SciWorldEnv(BaseEnv):
         self.state = State()
         # self.max_steps = self.max_steps_dict[self.task.sub_task_name]
 
+        task_max_steps = int(
+            self.max_steps_dict[self.task.sub_task_name]
+        )
 
-        task_max_steps = int(self.max_steps_dict[self.task.sub_task_name])
-
-        # Start from task-specific cap, then apply config cap (sciworld.json),
-        # then apply optional paper cap if provided.
-        effective_max_steps = task_max_steps
         if self._cfg_max_steps is not None:
-            effective_max_steps = max(effective_max_steps, self._cfg_max_steps)
-
-        # self.max_steps = effective_max_steps
-        self.max_steps = self._cfg_max_steps
+            # Paper-aligned fixed inference cap.
+            self.max_steps = int(self._cfg_max_steps)
+        else:
+            # Backward-compatible fallback only.
+            self.max_steps = task_max_steps
 
         self.env.load(self.task.sub_task_name, self.task.variation_idx, simplificationStr="easy", generateGoldPath=False)
         obs, info = self.env.reset()
         cur_task = info['taskDesc']
+
+        self.current_task_text = str(cur_task).strip()
+        self.current_observation = str(obs).strip()
+        self.current_inventory = str(
+            info.get("inv", "")
+        ).strip()
+
+        self.current_admissible_commands = list(
+            self.env.get_valid_action_object_combinations()
+        )
+
         #observation, messages = prompt_with_icl(self.instruction, self.raw_icl, cur_task, 1)
         if num_icl_examples > 0:
             observation, messages = prompt_with_icl(self.instruction, self.raw_icl, cur_task, num_icl_examples)
