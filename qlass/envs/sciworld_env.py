@@ -76,12 +76,12 @@ class SciWorldEnv(BaseEnv):
                 "content": observation,
             })
             self.state.steps += 1
-            self.state.reward = 0
+            if self.state.reward is None:
+                self.state.reward = 0.0
             if self.state.steps >= self.max_steps:
                 self.state.finished = True
                 self.state.success = False
                 self.state.terminate_reason = "max_steps"
-                self.state.reward = 0
             return observation, self.state
         try:
             observation, _, done, info = self.env.step(action)

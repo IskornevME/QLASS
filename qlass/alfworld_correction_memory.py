@@ -408,7 +408,6 @@ class AlfWorldCorrectionMemory:
             "attempt_id": attempt_id,
             "success": bool(success),
             "final_reward": self._safe_float(final_reward),
-            "reward_mode": "terminal_only",
             "terminal_step_penalty": self.terminal_step_penalty,
             "num_steps": len(stored_steps),
             "metadata": dict(episode_metadata or {}),
@@ -423,7 +422,7 @@ class AlfWorldCorrectionMemory:
                 self._append_jsonl(self.steps_path, asdict(stored_step))
 
         logger.info(
-            "Stored terminal-only ALFWorld episode #%d: "
+            "Stored episodic-memory episode #%d: "
             "task_id=%r, attempt_id=%r, steps=%d, success=%s, "
             "terminal_reward=%.1f, memory_steps=%d.",
             episode_number,
@@ -848,8 +847,6 @@ class AlfWorldCorrectionMemory:
 
         return rewards
 
-    # ПОКА НИКАК НЕ ИСПОЛЬЗУЕТСЯ
-    # TODO: ВСТРОИТЬ
     def _episode_rewards(
         self,
         *,

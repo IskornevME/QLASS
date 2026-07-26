@@ -38,8 +38,27 @@ class SciWorldTask(Task):
             task_idxs = task_idxs
         else:
             assert part_idx != -1
-            part_len = len(task_idxs) // part_num 
-            task_idxs = task_idxs[part_len * part_idx: part_len * (part_idx + 1)]
+            if part_num <= 0:
+                raise ValueError(
+                    "part_num must be positive."
+                )
+
+            if not 0 <= part_idx < part_num:
+                raise ValueError(
+                    "part_idx must satisfy "
+                    "0 <= part_idx < part_num."
+                )
+
+            start = (
+                len(task_idxs) * part_idx
+                // part_num
+            )
+            end = (
+                len(task_idxs) * (part_idx + 1)
+                // part_num
+            )
+
+            task_idxs = task_idxs[start:end]
         N_TASKS = len(task_idxs)
         
         def generator():

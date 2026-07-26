@@ -111,7 +111,7 @@ else
   AUG_TAG="no_aug"
 fi
 
-RUN_TAG="${DATA_PREFIX}_bon${BON}_${SPLIT}_run_${RUN_ID}_lambda${MEMORY_WEIGHT}_gamma${MEMORY_GAMMA}_k${MEMORY_TOP_K}_thr${MEMORY_THRESHOLD}_${MEMORY_SCOPE}_${TERMINAL_TAG}_${AUG_TAG}"
+RUN_TAG="${DATA_PREFIX}_bon${BON}_traj${N_TRAJS}_steps${MAX_STEPS}_${SPLIT}_run_${RUN_ID}_reward${MEMORY_REWARD_MODE}_lambda${MEMORY_WEIGHT}_gamma${MEMORY_GAMMA}_k${MEMORY_TOP_K}_thr${MEMORY_THRESHOLD}_${MEMORY_SCOPE}_${TERMINAL_TAG}_${AUG_TAG}"
 OUT_DIR="${OUT_DIR:-data/train/${TASK}/${SFT_MODEL_NAME}/q_correction_memory_without_perturb/${RUN_TAG}/}"
 MEMORY_DIR="${MEMORY_DIR:-${OUT_DIR}/memory}"
 MEMORY_LOG_FILE="${MEMORY_LOG_FILE:-${OUT_DIR}/${SLICE_ID}of${SLICE_NUM}_slices_bon_memory_correction_decisions.jsonl}"

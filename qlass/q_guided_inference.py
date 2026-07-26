@@ -359,6 +359,36 @@ def _extract_assistant_action_msgs(history: Sequence[Mapping[str, Any]]) -> List
     return actions
 
 
+def _extract_executed_assistant_msgs(
+    state: Any,
+) -> List[str]:
+    messages = [
+        str(message.get("content", "")).strip()
+        for message in state.history
+        if (
+            message.get("role") == "assistant"
+            and str(
+                message.get("content", "")
+            ).strip()
+        )
+    ]
+
+    num_executed_steps = int(
+        getattr(state, "steps", 0)
+    )
+
+    if num_executed_steps <= 0:
+        return []
+
+    if len(messages) < num_executed_steps:
+        raise RuntimeError(
+            "State contains fewer assistant messages "
+            "than executed environment steps."
+        )
+
+    return messages[-num_executed_steps:]
+
+
 def _get_task_text(
     env: Any,
     task: Any,
@@ -832,6 +862,7 @@ def main(args):
                     action_list: List[str] = []
                     candidate_records: List[Dict[str, Any]] = []
                     pre_action_admissible_commands: List[str] = []
+                    inventory_before_action = ""
 
                     # Generate N candidates and compute their original QLASS
                     # scores exactly as in the baseline.
@@ -847,6 +878,14 @@ def main(args):
                             )[:n_turn]
                             for act_text in prefix_actions:
                                 observation, state = env.step(act_text)
+
+                        if idx == 0:
+                            pre_action_admissible_commands = (
+                                env.get_admissible_commands()
+                            )
+                            inventory_before_action = str(
+                                env.get_inventory()
+                            ).strip()
 
                         replay_actions = _extract_assistant_action_msgs(state.history)
                         traj_actions = _extract_assistant_action_msgs(
@@ -1007,14 +1046,14 @@ def main(args):
                             _set_max_steps(env, turn_cap)
 
                             if n_turn > 0:
-                                prefix_actions = _extract_assistant_action_msgs(
-                                    cur_traj_state.history
+                                prefix_actions = _extract_executed_assistant_msgs(
+                                    cur_traj_state
                                 )[:n_turn]
                                 for act_text in prefix_actions:
                                     observation, state = env.step(act_text)
 
-                            replay_actions = _extract_assistant_action_msgs(state.history)
-                            traj_actions = _extract_assistant_action_msgs(cur_traj_state.history)
+                            replay_actions = _extract_executed_assistant_msgs(state)
+                            traj_actions = _extract_executed_assistant_msgs(cur_traj_state)
                             assert replay_actions == traj_actions, (
                                 f"[REPLAY ACTION MISMATCH - MEMORY AUG] n_turn={n_turn}\n"
                                 f"replay_actions={replay_actions}\n"
@@ -1487,7 +1526,7 @@ def main(args):
                         num_first_success += 1
 
 
-           if num_success > 0:
+            if num_success > 0:
                 mult_success_num += 1
 
             if correction_memory is not None:

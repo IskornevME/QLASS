@@ -27,6 +27,9 @@ KEEP_SERVER_ALIVE="${KEEP_SERVER_ALIVE:-0}"
 BON="${BON:-2}"
 ICL="${ICL:-1}"
 N_TRAJS="${N_TRAJS:-3}"
+
+TOKENIZER_PATH="${TOKENIZER_PATH:-${SFT_MODEL_PATH}}"
+
 SPLIT="${SPLIT:-test}"
 SLICE_NUM="${SLICE_NUM:-1}"
 SLICE_ID="${SLICE_ID:-0}"
@@ -176,6 +179,7 @@ CUDA_VISIBLE_DEVICES="${WORKER_GPU}" python qlass/q_guided_inference.py \
   --exp_name "${EXP_NAME}" \
   --exp_path qlass/configs/task/ \
   --exp_config "${TASK}" \
+  --tokenizer_path "${TOKENIZER_PATH}" \
   --split "${SPLIT}" \
   --slice_num "${SLICE_NUM}" \
   --slice_id "${SLICE_ID}" \
