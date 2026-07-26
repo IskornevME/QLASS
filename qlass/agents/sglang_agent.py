@@ -101,7 +101,10 @@ class SGLangAgent(LMAgent):
 
             # Remove a complete assistant/user turn
             # whenever possible.
-            remove_n = 2 if removable >= 2 else 1
+            if removable < 2:
+                break
+
+            remove_n = 2
 
             rest = rest[remove_n:]
             removed += remove_n
@@ -127,6 +130,12 @@ class SGLangAgent(LMAgent):
                 len(prefix),
                 len(rest),
             )
+
+        if removed > 0:
+            self._trim_calls += 1
+            self._trim_tokens_before_sum += before
+            self._trim_tokens_after_sum += n_tokens
+            self._trim_removed_msgs_sum += removed
 
         return prefix + rest
 

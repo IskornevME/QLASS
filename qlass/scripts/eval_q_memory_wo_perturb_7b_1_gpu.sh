@@ -42,31 +42,33 @@ BON="${BON:-2}"
 ICL="${ICL:-1}"
 N_TRAJS="${N_TRAJS:-3}"
 
+# Empty value means: evaluate all tasks.
+MAX_TASKS="${MAX_TASKS:-}"
+
+MAX_TASKS_ARGS=()
+
+if [[ -n "${MAX_TASKS}" ]]; then
+  if ! [[ "${MAX_TASKS}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "[ERROR] MAX_TASKS must be a positive integer, got: ${MAX_TASKS}" >&2
+    exit 1
+  fi
+
+  MAX_TASKS_ARGS=(
+    --max_tasks "${MAX_TASKS}"
+  )
+fi
+
 MAX_STEPS="${MAX_STEPS:-40}"
 
-POLICY_MAX_PROMPT_TOKENS="${
-  POLICY_MAX_PROMPT_TOKENS:-3800
-}"
-POLICY_KEEP_FIRST_N="${
-  POLICY_KEEP_FIRST_N:-3
-}"
-POLICY_MIN_TAIL_MSGS="${
-  POLICY_MIN_TAIL_MSGS:-4
-}"
+POLICY_MAX_PROMPT_TOKENS="${POLICY_MAX_PROMPT_TOKENS:-3800}"
+POLICY_KEEP_FIRST_N="${POLICY_KEEP_FIRST_N:-3}"
+POLICY_MIN_TAIL_MSGS="${POLICY_MIN_TAIL_MSGS:-4}"
 
-QNET_MAX_PROMPT_TOKENS="${
-  QNET_MAX_PROMPT_TOKENS:-3800
-}"
-QNET_KEEP_FIRST_N="${
-  QNET_KEEP_FIRST_N:-3
-}"
-QNET_MIN_TAIL_MSGS="${
-  QNET_MIN_TAIL_MSGS:-4
-}"
+QNET_MAX_PROMPT_TOKENS="${QNET_MAX_PROMPT_TOKENS:-3800}"
+QNET_KEEP_FIRST_N="${QNET_KEEP_FIRST_N:-3}"
+QNET_MIN_TAIL_MSGS="${QNET_MIN_TAIL_MSGS:-4}"
 
-TOKENIZER_PATH="${
-  TOKENIZER_PATH:-${SFT_MODEL_PATH}
-}"
+TOKENIZER_PATH="${TOKENIZER_PATH:-${SFT_MODEL_PATH}}"
 
 SPLIT="${SPLIT:-test}"
 SLICE_NUM="${SLICE_NUM:-1}"
@@ -101,6 +103,7 @@ MEMORY_MAX_AUGMENTED_ACTIONS="${MEMORY_MAX_AUGMENTED_ACTIONS:-2}"
 MEMORY_AUG_MAX_PER_CANONICAL="${MEMORY_AUG_MAX_PER_CANONICAL:-1}"
 MEMORY_AUGMENTATION_MIN_MEAN_RETURN="${MEMORY_AUGMENTATION_MIN_MEAN_RETURN:-1e-12}"
 MEMORY_AUGMENTED_ACTION_FORMAT="${MEMORY_AUGMENTED_ACTION_FORMAT:-retrieved_thought_exact_only}"
+MEMORY_REWARD_MODE="${MEMORY_REWARD_MODE:-terminal_only}"
 
 if [[ "${ENABLE_MEMORY_ACTION_AUGMENTATION}" == "1" ]]; then
   AUG_TAG="aug${MEMORY_MAX_AUGMENTED_ACTIONS}_percanon${MEMORY_AUG_MAX_PER_CANONICAL}_${MEMORY_AUGMENTED_ACTION_FORMAT}"
@@ -132,7 +135,7 @@ if [[ "${ENABLE_MEMORY}" == "1" ]]; then
     --memory_gamma "${MEMORY_GAMMA}"
     --memory_top_k "${MEMORY_TOP_K}"
     --memory_threshold "${MEMORY_THRESHOLD}"
-    --memory_reward_mode terminal_only
+    --memory_reward_mode "${MEMORY_REWARD_MODE}"
     --no-memory_use_env_reward_fallback
     --memory_terminal_step_penalty "${MEMORY_TERMINAL_STEP_PENALTY}"
     --memory_scope "${MEMORY_SCOPE}"
@@ -176,6 +179,7 @@ echo "[CONFIG] Memory scope:    ${MEMORY_SCOPE}; reset=${RESET_MEMORY}; dynamic_
 echo "[CONFIG] Terminal success override: ${PREFER_TERMINAL_SUCCESS}"
 echo "[CONFIG] Memory action augmentation: ${ENABLE_MEMORY_ACTION_AUGMENTATION}; max_aug=${MEMORY_MAX_AUGMENTED_ACTIONS}; max_per_canonical=${MEMORY_AUG_MAX_PER_CANONICAL}; min_return=${MEMORY_AUGMENTATION_MIN_MEAN_RETURN}"
 echo "[CONFIG] Memory augmented action format: ${MEMORY_AUGMENTED_ACTION_FORMAT}"
+echo "[CONFIG] Max tasks:       ${MAX_TASKS:-all}"
 
 # ---------------------------------------------------------------------------
 # Start the SFT policy server; clean it up when inference ends.
@@ -233,6 +237,7 @@ CUDA_VISIBLE_DEVICES="${WORKER_GPU}" python qlass/q_guided_inference.py \
   --sample_mode bon \
   --best_of_N "${BON}" \
   --n_trajs "${N_TRAJS}" \
+  "${MAX_TASKS_ARGS[@]}" \
   --force_first \
   --disable_perturb \
   --verbose \

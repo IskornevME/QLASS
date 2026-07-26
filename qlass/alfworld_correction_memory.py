@@ -118,6 +118,7 @@ class AlfWorldCorrectionMemory:
         threshold_decay_horizon: int = 20,
         persist: bool = True,
         benchmark: str = "alfworld",
+        reward_mode: str = "terminal_only",
     ) -> None:
         """Initialize memory and load previously stored records, if any."""
         if benchmark not in {"alfworld", "sciworld"}:
@@ -126,6 +127,16 @@ class AlfWorldCorrectionMemory:
             )
 
         self.benchmark = benchmark
+
+        if reward_mode not in {
+            "terminal_only",
+            "final_score",
+        }:
+            raise ValueError(
+                f"Unsupported reward mode: {reward_mode!r}"
+            )
+
+        self.reward_mode = reward_mode
 
         self.base_dir = base_dir
         self.gamma = self._validate_probability("gamma", gamma)
@@ -221,6 +232,7 @@ class AlfWorldCorrectionMemory:
                 bool(episode.get("success", False))
                 for episode in self._episodes
             ),
+            "reward_mode": self.reward_mode,
             "num_stored_steps": len(self),
             "gamma": self.gamma,
             "top_k": self.top_k,
@@ -318,9 +330,10 @@ class AlfWorldCorrectionMemory:
         self.current_episode_number += 1
         episode_number = self.current_episode_number
 
-        terminal_rewards = self._terminal_only_rewards(
+        episode_rewards = self._episode_rewards(
             num_steps=len(executed_steps),
             success=bool(success),
+            final_reward=self._safe_float(final_reward),
         )
 
         stored_steps: List[StoredStep] = []
@@ -379,7 +392,7 @@ class AlfWorldCorrectionMemory:
                 episode_final_reward=self._safe_float(final_reward),
                 trajectory_context=trajectory_context,
                 current_env_info=current_env_info,
-                future_rewards=list(terminal_rewards[step_index:]),
+                future_rewards=list(episode_rewards[step_index:]),
             )
 
             stored_steps.append(stored_step)
@@ -390,6 +403,7 @@ class AlfWorldCorrectionMemory:
 
         episode_record: Dict[str, Any] = {
             "episode_number": episode_number,
+            "reward_mode": self.reward_mode,
             "task_id": None if task_id is None else str(task_id),
             "attempt_id": attempt_id,
             "success": bool(success),
@@ -417,7 +431,7 @@ class AlfWorldCorrectionMemory:
             attempt_id,
             len(stored_steps),
             bool(success),
-            terminal_rewards[-1],
+            episode_rewards[-1],
             len(self._steps),
         )
 
@@ -426,7 +440,7 @@ class AlfWorldCorrectionMemory:
             "episode_number": episode_number,
             "steps_added": len(stored_steps),
             "success": bool(success),
-            "terminal_reward": terminal_rewards[-1],
+            "terminal_reward": episode_rewards[-1],
             "memory_steps_after": len(self._steps),
         }
 
@@ -858,7 +872,9 @@ class AlfWorldCorrectionMemory:
                 min(1.0, float(final_reward)),
             )
         else:
-            raise ValueError(...)
+            raise ValueError(
+                f"Unsupported reward mode: {self.reward_mode!r}"
+            )
 
         rewards[-1] = terminal_value
         return rewards

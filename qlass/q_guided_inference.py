@@ -589,7 +589,18 @@ def main(args):
     # initialize all the tasks
     task_config: Dict[str, Any] = exp_config["task"]
     task_class: tasks.Task = getattr(tasks, task_config["task_class"])
-    all_tasks, n_tasks = task_class.load_tasks(args.split, args.slice_num, args.slice_id) 
+    all_tasks, n_tasks = task_class.load_tasks(args.split, args.slice_num, args.slice_id)
+
+    if args.max_tasks is not None:
+        if args.max_tasks <= 0:
+            raise ValueError("--max_tasks must be a positive integer.")
+
+        effective_n_tasks = min(
+            n_tasks,
+            args.max_tasks,
+        )
+    else:
+        effective_n_tasks = n_tasks
     
     # initialize the agent
     agent: agents.LMAgent = getattr(agents, agent_config["agent_class"])(
@@ -641,6 +652,7 @@ def main(args):
             terminal_step_penalty=args.memory_terminal_step_penalty,
             dynamic_threshold=not args.memory_disable_dynamic_threshold,
             persist=True,
+            reward_mode=args.memory_reward_mode,
         )
         if args.reset_memory:
             correction_memory.clear(delete_files=True)
@@ -657,6 +669,8 @@ def main(args):
             {
                 "record_type": "run_config",
                 "exp_config": args.exp_config,
+                "max_tasks": args.max_tasks,
+                "max_steps": turn_cap,
                 "split": args.split,
                 "slice_id": args.slice_id,
                 "slice_num": args.slice_num,
@@ -705,7 +719,7 @@ def main(args):
         "selection_changed_by_augmentation": 0,
     }
     with logging_redirect_tqdm():
-        pbar = tqdm(total=n_tasks)
+        pbar = tqdm(total=effective_n_tasks)
         for i, task in enumerate(all_tasks):
             if (
                 args.max_tasks is not None
@@ -734,7 +748,7 @@ def main(args):
                 f"args.exp_config={args.exp_config} "
                 f"env_config.max_steps={env_config.get('max_steps', None)} "
                 f"env.max_steps={getattr(env, 'max_steps', None)} "
-                f"MAX_TURNS={MAX_TURNS.get(args.exp_config, None)}"
+                f"turn_cap={turn_cap}"
             )
 
             _set_max_steps(env, turn_cap)
@@ -808,6 +822,9 @@ def main(args):
                             env.get_current_observation()
                         ),
                     )
+                    inventory_before_action = str(
+                        env.get_inventory()
+                    ).strip()
                     previous_action_commands = [
                         step["action_command"] for step in executed_steps
                     ]
@@ -971,7 +988,7 @@ def main(args):
                             existing_candidate_actions=[
                                 record["action_command"] for record in candidate_records
                             ],
-                            inventory="",
+                            inventory=inventory_before_action,
                             min_mean_return=args.memory_augmentation_min_mean_return,
                             max_actions=args.memory_max_augmented_actions,
                             max_per_canonical=args.memory_aug_max_per_canonical,
@@ -1076,7 +1093,7 @@ def main(args):
                                 record["action_command"]
                                 for record in candidate_records
                             ],
-                            inventory="",
+                            inventory=inventory_before_action,
                         )
                         memory_scores = memory_result["candidate_scores"]
                         assert len(memory_scores) == len(candidate_records)
@@ -1288,6 +1305,7 @@ def main(args):
                                 "step_id": n_turn,
                                 "task_text": task_text,
                                 "observation_before_action": observation_before_action,
+                                "inventory_before_action": inventory_before_action,
                                 "previous_action_commands": previous_action_commands,
                                 "memory_size_before": memory_result["memory_size"],
                                 "num_retrieved_neighbors": len(
@@ -1375,7 +1393,7 @@ def main(args):
                         {
                             "task_text": task_text,
                             "observation_before_action": observation_before_action,
-                            "inventory_before_action": "",
+                            "inventory_before_action": inventory_before_action,
                             "action_command": selected_record["action_command"],
                             "raw_action": selected_record["raw_action"],
                             "env_reward": _safe_float(new_state.reward),
@@ -1469,7 +1487,7 @@ def main(args):
                         num_first_success += 1
 
 
-            if num_success > 1:
+           if num_success > 0:
                 mult_success_num += 1
 
             if correction_memory is not None:
@@ -1526,12 +1544,13 @@ def main(args):
 
     n_traj = len(total_examples)
     rewards = [_safe_float(traj.get("reward", 0.0)) for traj in total_examples]
-    n_success = sum(1.0 for reward in rewards if reward == 1.0)
+    n_success = sum(int(bool(traj.get("success", False))) for traj in total_examples)
     average_reward = sum(rewards) / n_traj if n_traj > 0 else 0.0
+    processed_n_tasks = len(done_task_id)
 
     print(f"Finally, The Number of Successful Trajectories: {n_success} / {n_traj} ")
-    print(f"Finally, The Number of Successful Trajectories with multi evaluation: {mult_success_num} / {n_tasks} ")
-    print(f"Finally, The Number of Successful Trajectories with first inference: {num_first_success} / {n_tasks} ")
+    print(f"Finally, The Number of Successful Trajectories with multi evaluation: {mult_success_num} / {processed_n_tasks} ")
+    print(f"Finally, The Number of Successful Trajectories with first inference: {num_first_success} / {processed_n_tasks} ")
     print(f"Average Reward: {average_reward}")
     if correction_memory is not None:
         decision_steps = memory_run_stats["decision_steps"]
