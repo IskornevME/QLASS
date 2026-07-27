@@ -8,6 +8,7 @@
         "env_jar_path": "envs/scienceworld/scienceworld.jar",
         "icl_path": "eval_agent/prompt/icl_examples/sciworld_icl.json",
         "icl_format": "conversation",
-        "max_steps": 40
+        "max_steps": 40,
+        "internal_env_step_limit": 200
     }
 }

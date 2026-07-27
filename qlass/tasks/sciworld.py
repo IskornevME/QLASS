@@ -34,15 +34,14 @@ class SciWorldTask(Task):
         else:
             raise ValueError
         taskname2id = json.load(open("eval_agent/data/sciworld/taskname2id.json"))
-        if part_num == 1:
-            task_idxs = task_idxs
-        else:
-            assert part_idx != -1
-            if part_num <= 0:
-                raise ValueError(
-                    "part_num must be positive."
-                )
+        if part_num <= 0:
+            raise ValueError(
+                "part_num must be positive."
+            )
 
+        if part_num == 1:
+            pass
+        else:
             if not 0 <= part_idx < part_num:
                 raise ValueError(
                     "part_idx must satisfy "

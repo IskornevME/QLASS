@@ -111,24 +111,46 @@ class SciWorldEnv(BaseEnv):
         })
 
         self.state.steps += 1
-        if self.state.steps >= self.max_steps:
-            self.state.finished = True
-            self.state.success = False
-            self.state.terminate_reason = "max_steps"
-            # self.state.reward = 0
 
         if done:
             task_completed = bool(
                 info.get("task_completed", False)
             )
+            terminated_by_internal_step_limit = bool(
+                info.get(
+                    "terminated_by_step_limit",
+                    False,
+                )
+            )
+            terminated_by_negative_score = bool(
+                info.get(
+                    "terminated_by_negative_score",
+                    False,
+                )
+            )
 
             self.state.finished = True
             self.state.success = task_completed
-            self.state.terminate_reason = (
-                "success"
-                if task_completed
-                else "environment_done"
-            )
+
+            if task_completed:
+                self.state.terminate_reason = "success"
+            elif terminated_by_internal_step_limit:
+                self.state.terminate_reason = (
+                    "internal_env_step_limit"
+                )
+            elif terminated_by_negative_score:
+                self.state.terminate_reason = (
+                    "negative_score"
+                )
+            else:
+                self.state.terminate_reason = (
+                    "environment_done_unknown"
+                )
+
+        elif self.state.steps >= self.max_steps:
+            self.state.finished = True
+            self.state.success = False
+            self.state.terminate_reason = "max_steps"
 
         return observation, self.state
     

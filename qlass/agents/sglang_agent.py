@@ -73,83 +73,180 @@ class SGLangAgent(LMAgent):
         # Same format as before: add assistant stub
         return chat.get_prompt(messages + [{"role": "assistant", "content": None}])
 
-    def _maybe_trim_messages(self, chat, messages: List[dict]) -> List[dict]:
+    def _maybe_trim_messages(
+        self,
+        chat,
+        messages: List[dict],
+    ) -> List[dict]:
         if not self.max_prompt_tokens:
             return messages
 
         tok = self._get_tokenizer()
-        prompt = self._build_prompt(chat, messages)
-        n_tokens = len(tok(prompt, add_special_tokens=True).input_ids)
-        if n_tokens <= self.max_prompt_tokens:
-            return messages
 
-        # Keep the first N messages unchanged, trim oldest from the remainder
-        keep_n = min(self.keep_first_n, len(messages))
-        prefix = messages[:keep_n]
-        rest = messages[keep_n:]
-
-        before = n_tokens
-        removed = 0
-
-        while (
-            n_tokens > self.max_prompt_tokens
-            and len(rest) > self.min_tail_msgs
-        ):
-            removable = (
-                len(rest) - self.min_tail_msgs
-            )
-
-            # Remove a complete assistant/user turn
-            # whenever possible.
-            if removable < 2:
-                break
-
-            remove_n = 2
-
-            rest = rest[remove_n:]
-            removed += remove_n
-
+        def count_tokens(
+            current_messages: List[dict],
+        ) -> int:
             prompt = self._build_prompt(
                 chat,
-                prefix + rest,
+                current_messages,
             )
-            n_tokens = len(
+            return len(
                 tok(
                     prompt,
                     add_special_tokens=True,
+                    truncation=False,
+                    verbose=False,
                 ).input_ids
             )
 
-        if n_tokens > self.max_prompt_tokens:
-            logger.warning(
-                "[TRIM_INCOMPLETE] prompt still exceeds "
-                "the configured policy limit: "
-                "%d > %d; prefix=%d, tail=%d",
-                n_tokens,
-                self.max_prompt_tokens,
-                len(prefix),
-                len(rest),
+        n_tokens_before = count_tokens(
+            messages
+        )
+
+        if (
+            n_tokens_before
+            <= self.max_prompt_tokens
+        ):
+            return messages
+
+        keep_n = min(
+            self.keep_first_n,
+            len(messages),
+        )
+
+        prefix = messages[:keep_n]
+        rest = messages[keep_n:]
+
+        n_tokens = n_tokens_before
+        removed = 0
+        relaxed_tail_constraint = False
+
+        # Первый этап:
+        # удаляем старые полные interaction turns,
+        # но сохраняем как минимум min_tail_msgs.
+        preferred_min_tail = max(
+            int(self.min_tail_msgs),
+            2,
+        )
+
+        while (
+            n_tokens > self.max_prompt_tokens
+            and len(rest) - preferred_min_tail >= 2
+        ):
+            rest = rest[2:]
+            removed += 2
+
+            n_tokens = count_tokens(
+                prefix + rest
             )
 
-        if removed > 0:
-            self._trim_calls += 1
-            self._trim_tokens_before_sum += before
-            self._trim_tokens_after_sum += n_tokens
-            self._trim_removed_msgs_sum += removed
+        # Второй, аварийный этап:
+        # policy вызывается на истории, которая заканчивается
+        # последним user observation. Поэтому минимально нужно
+        # сохранить два последних сообщения:
+        #
+        #   assistant: последнее действие
+        #   user: последнее наблюдение
+        min_safe_tail = 2
 
-        return prefix + rest
+        while (
+            n_tokens > self.max_prompt_tokens
+            and len(rest) - min_safe_tail >= 2
+        ):
+            relaxed_tail_constraint = True
+
+            rest = rest[2:]
+            removed += 2
+
+            n_tokens = count_tokens(
+                prefix + rest
+            )
+
+        trimmed_messages = prefix + rest
+
+        if relaxed_tail_constraint:
+            logger.warning(
+                "[POLICY_TRIM_RELAXED_TAIL] "
+                "The configured minimum tail could not be preserved. "
+                "before_tokens=%d after_tokens=%d "
+                "configured_min_tail=%d actual_tail=%d "
+                "removed_messages=%d",
+                n_tokens_before,
+                n_tokens,
+                self.min_tail_msgs,
+                len(rest),
+                removed,
+            )
+
+        if n_tokens > self.max_prompt_tokens:
+            raise RuntimeError(
+                "[POLICY_TRIM_FAILED] "
+                "Policy prompt cannot be reduced to the configured "
+                "limit while preserving the initial prefix and the "
+                "latest action/observation pair. "
+                f"tokens={n_tokens}, "
+                f"limit={self.max_prompt_tokens}, "
+                f"prefix_messages={len(prefix)}, "
+                f"tail_messages={len(rest)}"
+            )
+
+        self._trim_calls += 1
+        self._trim_tokens_before_sum += (
+            n_tokens_before
+        )
+        self._trim_tokens_after_sum += (
+            n_tokens
+        )
+        self._trim_removed_msgs_sum += removed
+
+        logger.info(
+            "[POLICY_TRIM] "
+            "before_tokens=%d after_tokens=%d "
+            "removed_messages=%d prefix=%d tail=%d",
+            n_tokens_before,
+            n_tokens,
+            removed,
+            len(prefix),
+            len(rest),
+        )
+
+        return trimmed_messages
 
 
-    def _log_trim_summary(self):
+    def _log_trim_summary(self) -> None:
         if self._trim_total_calls <= 0:
             return
-        ratio = self._trim_calls / max(1, self._trim_total_calls)
+
+        trim_ratio = (
+            self._trim_calls
+            / self._trim_total_calls
+        )
+
         logger.warning(
-            f"[TRIM_SUMMARY] pid={os.getpid()} total_calls={self._trim_total_calls} "
-            f"trim_calls={self._trim_calls} ratio={ratio:.3f} "
-            f"avg_before={self._trim_tokens_before_sum/max(1,self._trim_calls):.1f} "
-            f"avg_after={self._trim_tokens_after_sum/max(1,self._trim_calls):.1f} "
-            f"avg_removed_msgs={self._trim_removed_msgs_sum/max(1,self._trim_calls):.2f}"
+            "[TRIM_SUMMARY] "
+            "pid=%d "
+            "total_calls=%d "
+            "trim_calls=%d "
+            "ratio=%.3f "
+            "avg_before=%.1f "
+            "avg_after=%.1f "
+            "avg_removed_msgs=%.2f",
+            os.getpid(),
+            self._trim_total_calls,
+            self._trim_calls,
+            trim_ratio,
+            (
+                self._trim_tokens_before_sum
+                / max(1, self._trim_calls)
+            ),
+            (
+                self._trim_tokens_after_sum
+                / max(1, self._trim_calls)
+            ),
+            (
+                self._trim_removed_msgs_sum
+                / max(1, self._trim_calls)
+            ),
         )
 
 

@@ -122,7 +122,14 @@ def evaluate_trajs_qnet_v2(model, tokenizer, new_state, batch_size=1, disable_tq
             assert role == roles_list[j % 2]
             msgs.append({"role": role, "content": s["value"]})
         prompt = chat.get_prompt(msgs + [{"role": "assistant", "content": None}])
-        return len(tokenizer(prompt, add_special_tokens=True).input_ids)
+        return len(
+            tokenizer(
+                prompt,
+                add_special_tokens=True,
+                truncation=False,
+                verbose=False,
+            ).input_ids
+        )
 
     max_prompt_tokens = getattr(tokenizer, "model_max_length", 4096)
     # Use CLI caps if present (added below), else defaults
@@ -130,20 +137,114 @@ def evaluate_trajs_qnet_v2(model, tokenizer, new_state, batch_size=1, disable_tq
     keep_first_n = getattr(model, "_qnet_keep_first_n", 3)
     min_tail_msgs = getattr(model, "_qnet_min_tail_msgs", 4)
 
-    trimmed = sources[0]
-    n_tok = _prompt_tokens(trimmed)
-    if n_tok > max_prompt_tokens and len(trimmed) > keep_first_n + min_tail_msgs:
-        prefix = trimmed[:keep_first_n]
-        rest = trimmed[keep_first_n:]
-        # remove oldest turns by 2 messages to preserve alternation
-        while n_tok > max_prompt_tokens and len(rest) > min_tail_msgs:
-            if len(rest) >= 2:
-                rest = rest[2:]
-            else:
-                break
+    trimmed = list(sources[0])
+
+    n_tok_before = _prompt_tokens(
+        trimmed
+    )
+    n_tok = n_tok_before
+
+    removed_msgs = 0
+    relaxed_tail_constraint = False
+
+    if n_tok > max_prompt_tokens:
+        keep_n = min(
+            keep_first_n,
+            len(trimmed),
+        )
+
+        prefix = trimmed[:keep_n]
+        rest = trimmed[keep_n:]
+
+        # Первый этап:
+        # сохраняем заданное пользователем количество последних
+        # сообщений. Удаляем только полные пары сообщений,
+        # чтобы не нарушить чередование human/gpt.
+        preferred_min_tail = max(
+            int(min_tail_msgs),
+            3,
+        )
+
+        while (
+            n_tok > max_prompt_tokens
+            and len(rest) - preferred_min_tail >= 2
+        ):
+            rest = rest[2:]
+            removed_msgs += 2
+
             trimmed = prefix + rest
-            n_tok = _prompt_tokens(trimmed)
+            n_tok = _prompt_tokens(
+                trimmed
+            )
+
+        # Второй, аварийный этап:
+        # если с min_tail_msgs=4 prompt всё ещё слишком длинный,
+        # разрешаем сократить хвост до минимально безопасных
+        # трёх сообщений.
+        #
+        # Для QNet conversation заканчивается текущим
+        # candidate action:
+        #
+        #   previous assistant action
+        #   latest user observation
+        #   current candidate action
+        #
+        # Поэтому здесь требуется не менее трёх сообщений.
+        min_safe_tail = 3
+
+        while (
+            n_tok > max_prompt_tokens
+            and len(rest) - min_safe_tail >= 2
+        ):
+            relaxed_tail_constraint = True
+
+            rest = rest[2:]
+            removed_msgs += 2
+
+            trimmed = prefix + rest
+            n_tok = _prompt_tokens(
+                trimmed
+            )
+
+        trimmed = prefix + rest
         sources = [trimmed]
+
+        if relaxed_tail_constraint:
+            logger.warning(
+                "[QNET_TRIM_RELAXED_TAIL] "
+                "The configured minimum tail could not be preserved. "
+                "before_tokens=%d after_tokens=%d "
+                "configured_min_tail=%d actual_tail=%d "
+                "removed_messages=%d",
+                n_tok_before,
+                n_tok,
+                min_tail_msgs,
+                len(rest),
+                removed_msgs,
+            )
+
+        if n_tok > max_prompt_tokens:
+            raise RuntimeError(
+                "[QNET_TRIM_FAILED] "
+                "QNet prompt cannot be reduced to the configured limit "
+                "while preserving the initial prefix and the latest "
+                "observation/action context. "
+                f"tokens={n_tok}, "
+                f"limit={max_prompt_tokens}, "
+                f"prefix_messages={len(prefix)}, "
+                f"tail_messages={len(rest)}"
+            )
+
+        logger.info(
+            "[QNET_TRIM] "
+            "before_tokens=%d after_tokens=%d "
+            "removed_messages=%d prefix=%d tail=%d",
+            n_tok_before,
+            n_tok,
+            removed_msgs,
+            len(prefix),
+            len(rest),
+        )
     # ---------------------------------------------------------------------------
 
     # data_dict = preprocess(sources, tokenizer, model_name, [0.0 for _ in range(len(sources))])
@@ -345,18 +446,6 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
         return default
 
     return result if np.isfinite(result) else default
-
-
-def _extract_assistant_action_msgs(history: Sequence[Mapping[str, Any]]) -> List[str]:
-    """Return assistant responses that were actually submitted to the environment."""
-    actions: List[str] = []
-    for message in history:
-        if message.get("role") != "assistant":
-            continue
-        text = str(message.get("content", "")).strip()
-        if ("Action:" in text) or text.isdigit():
-            actions.append(text)
-    return actions
 
 
 def _extract_executed_assistant_msgs(
@@ -614,7 +703,22 @@ def main(args):
         from scienceworld import ScienceWorldEnv
         from eval_agent.utils.replace_sciworld_score import sciworld_monkey_patch
         sciworld_monkey_patch()
-        env_config['env'] = ScienceWorldEnv("", serverPath=os.path.join(os.getcwd(), env_config['env_jar_path']), envStepLimit=turn_cap + 1)
+
+        internal_env_step_limit = int(
+            env_config.get(
+                "internal_env_step_limit",
+                200,
+            )
+        )
+
+        env_config["env"] = ScienceWorldEnv(
+            "",
+            serverPath=os.path.join(
+                os.getcwd(),
+                env_config["env_jar_path"],
+            ),
+            envStepLimit=internal_env_step_limit,
+        )
 
     # initialize all the tasks
     task_config: Dict[str, Any] = exp_config["task"]
@@ -852,9 +956,6 @@ def main(args):
                             env.get_current_observation()
                         ),
                     )
-                    inventory_before_action = str(
-                        env.get_inventory()
-                    ).strip()
                     previous_action_commands = [
                         step["action_command"] for step in executed_steps
                     ]
@@ -872,12 +973,19 @@ def main(args):
                         )
                         _set_max_steps(env, turn_cap)
 
-                        if n_turn > 0:
-                            prefix_actions = _extract_assistant_action_msgs(
-                                cur_traj_state.history
-                            )[:n_turn]
-                            for act_text in prefix_actions:
-                                observation, state = env.step(act_text)
+                        prefix_actions = _extract_executed_assistant_msgs(
+                            cur_traj_state
+                        )
+
+                        assert len(prefix_actions) == n_turn, (
+                            "[REPLAY STEP COUNT MISMATCH] "
+                            f"n_turn={n_turn}, "
+                            f"executed_actions={len(prefix_actions)}, "
+                            f"state_steps={getattr(cur_traj_state, 'steps', None)}"
+                        )
+
+                        for act_text in prefix_actions:
+                            observation, state = env.step(act_text)
 
                         if idx == 0:
                             pre_action_admissible_commands = (
@@ -887,18 +995,17 @@ def main(args):
                                 env.get_inventory()
                             ).strip()
 
-                        replay_actions = _extract_assistant_action_msgs(state.history)
-                        traj_actions = _extract_assistant_action_msgs(
-                            cur_traj_state.history
+                        replay_actions = _extract_executed_assistant_msgs(
+                            state
+                        )
+                        traj_actions = _extract_executed_assistant_msgs(
+                            cur_traj_state
                         )
                         assert replay_actions == traj_actions, (
                             f"[REPLAY ACTION MISMATCH] n_turn={n_turn}\n"
                             f"replay_actions={replay_actions}\n"
                             f"traj_actions={traj_actions}\n"
                         )
-
-                        if idx == 0 and hasattr(env, "get_admissible_commands"):
-                            pre_action_admissible_commands = env.get_admissible_commands()
 
                         if (not idx) or args.disable_perturb:
                             cur_state_history = cur_traj_state.history
@@ -1001,6 +1108,7 @@ def main(args):
                                 "memory_aug_examples": [],
                                 "memory_canonical_action": "",
                                 "memory_action_examples": [],
+                                "terminate_reason": (new_state.terminate_reason),
                             }
                         )
 
@@ -1116,6 +1224,7 @@ def main(args):
                                     ),
                                     "memory_canonical_action": "",
                                     "memory_action_examples": [],
+                                    "terminate_reason": (new_state.terminate_reason),
                                 }
                             )
 
@@ -1506,6 +1615,10 @@ def main(args):
                     "reward": cur_traj_state.reward,
                     "success": cur_traj_state.success,
                     "action_value_dict": action_value_list,
+                    "task_index": i,
+                    "attempt_id": traj_id,
+                    "num_steps": int(cur_traj_state.steps),
+                    "terminate_reason": (cur_traj_state.terminate_reason),
                 }
                 if correction_memory is not None:
                     trajectory_record["memory_correction_summary"] = {
