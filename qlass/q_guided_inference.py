@@ -647,36 +647,6 @@ def _parse_action_for_memory(
         return INVALID_ACTION_COMMAND
 
 
-def _parse_action_for_memory(
-    env: Any,
-    raw_action: str,
-    *,
-    task_id: Any,
-    attempt_id: int,
-    step_id: int,
-    candidate_id: int,
-) -> str:
-    """Parse the environment command used as an action key in memory.
-
-    ``AlfWorldEnv.step`` already handles malformed responses. Therefore a
-    parsing failure must be logged, but must not abort the whole evaluation.
-    """
-    try:
-        return str(env.parse_action(raw_action)).strip()
-    except Exception as exc:
-        fallback = re.sub(r"\s+", " ", str(raw_action).strip().lower())
-        logger.warning(
-            "[ACTION_PARSE_FAILED] task=%r attempt=%d step=%d candidate=%d "
-            "error=%s fallback=%r",
-            task_id,
-            attempt_id,
-            step_id,
-            candidate_id,
-            exc,
-            fallback,
-        )
-        return fallback
-
 def main(args):
     total_examples = []
     total_trees = []
