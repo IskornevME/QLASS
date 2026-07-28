@@ -34,6 +34,8 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence
 
 logger = logging.getLogger(__name__)
 
+INVALID_ACTION_COMMAND = "__invalid_action__"
+
 
 @dataclass(frozen=True)
 class StoredStep:
@@ -350,10 +352,16 @@ class AlfWorldCorrectionMemory:
             )
 
             if not action:
-                raise ValueError(
-                    f"Episode step {step_index} does not contain "
-                    "a non-empty action_command/action."
+                logger.warning(
+                    "[MEMORY_EMPTY_ACTION] task_id=%r attempt_id=%r "
+                    "step_index=%d raw_action=%r; using fallback=%r.",
+                    task_id,
+                    attempt_id,
+                    step_index,
+                    raw_action[:200],
+                    INVALID_ACTION_COMMAND,
                 )
+                action = INVALID_ACTION_COMMAND
 
             task_text = self._safe_text(step.get("task_text", ""))
             observation = self._safe_text(
@@ -677,6 +685,10 @@ class AlfWorldCorrectionMemory:
         matches: List[Dict[str, Any]] = []
 
         for stored_step in self._steps:
+
+            if stored_step.action == INVALID_ACTION_COMMAND:
+                continue
+
             history_similarity = self._multiset_jaccard(
                 query_history_tokens,
                 self._tokenize(stored_step.trajectory_context),

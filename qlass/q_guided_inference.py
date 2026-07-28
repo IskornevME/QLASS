@@ -588,6 +588,65 @@ def _build_memory_augmented_raw_action(
 
     raise ValueError(f"Unsupported memory_augmented_action_format: {action_format}")
 
+
+INVALID_ACTION_COMMAND = "__invalid_action__"
+
+
+def _parse_action_for_memory(
+    env: Any,
+    raw_action: str,
+    *,
+    task_id: Any,
+    attempt_id: int,
+    step_id: int,
+    candidate_id: int,
+) -> str:
+    """Return a non-empty memory key for one submitted model response.
+
+    A malformed or empty environment action is represented by a sentinel
+    that cannot match a valid admissible command. This preserves the executed
+    step without allowing it to become a memory-augmentation candidate.
+    """
+    raw_text = (
+        ""
+        if raw_action is None
+        else str(raw_action)
+    )
+
+    try:
+        parsed_action = str(
+            env.parse_action(raw_text)
+        ).strip()
+
+        if not parsed_action:
+            raise ValueError(
+                "Environment parser returned an empty action."
+            )
+
+        return parsed_action
+
+    except Exception as exc:
+        raw_preview = re.sub(
+            r"\s+",
+            " ",
+            raw_text.strip(),
+        )[:200]
+
+        logger.warning(
+            "[ACTION_PARSE_FAILED] task=%r attempt=%d step=%d "
+            "candidate=%d error=%s raw=%r fallback=%r",
+            task_id,
+            attempt_id,
+            step_id,
+            candidate_id,
+            exc,
+            raw_preview,
+            INVALID_ACTION_COMMAND,
+        )
+
+        return INVALID_ACTION_COMMAND
+
+
 def _parse_action_for_memory(
     env: Any,
     raw_action: str,
