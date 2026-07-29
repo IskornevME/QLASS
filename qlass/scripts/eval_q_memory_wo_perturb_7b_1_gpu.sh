@@ -4,6 +4,9 @@ set -euo pipefail
 MODEL_NAME="${MODEL_NAME:-Llama-2-7b-chat-hf}"
 BENCHMARK="${BENCHMARK:-${TASK:-alfworld}}"
 
+SGLANG_PYTHON="${SGLANG_PYTHON:-/home/m.iskornev/miniforge3/envs/my_env/bin/python}"
+QLASS_PYTHON="${QLASS_PYTHON:-/home/m.iskornev/miniforge3/envs/my_env/bin/python}"
+
 case "${BENCHMARK}" in
   alfworld|sciworld)
     ;;
@@ -17,12 +20,12 @@ TASK="${BENCHMARK}"
 
 EXP_NAME="${EXP_NAME:-qlass}"
 
-# CHANGE IT FOG SCIWORLD
+# CHANGE IT FOR SCIWORLD
 SFT_MODEL_NAME="${SFT_MODEL_NAME:-${EXP_NAME}-${MODEL_NAME}-${TASK}-sft}"
 Q_MODEL_NAME="${Q_MODEL_NAME:-${EXP_NAME}-${MODEL_NAME}-${TASK}-Q}"
 # To use an inference checkpoint instead, launch with e.g.:
 #   Q_MODEL_NAME_CHECKPOINT="qlass-Llama-2-7b-chat-hf-alfworld-Q/infer-checkpoint-14382" bash ...
-# CHANGE IT FOG SCIWORLD
+# CHANGE IT FOR SCIWORLD
 Q_MODEL_NAME_CHECKPOINT="${Q_MODEL_NAME_CHECKPOINT:-${Q_MODEL_NAME}}"
 
 SFT_MODEL_PATH="${MODEL_PATH%/}/${SFT_MODEL_NAME}"
@@ -198,7 +201,7 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 echo "[INFO] Starting SGLang policy server on port ${SGLANG_PORT}."
-CUDA_VISIBLE_DEVICES="${SERVER_GPU}" python3 -m sglang.launch_server \
+CUDA_VISIBLE_DEVICES="${SERVER_GPU}" "${SGLANG_PYTHON}" -m sglang.launch_server \
   --model-path "${SFT_MODEL_PATH}" \
   --port "${SGLANG_PORT}" \
   > "${SERVER_LOG}" 2>&1 &
@@ -214,7 +217,7 @@ fi
 export OPENAI_API_KEY="${OPENAI_API_KEY:-dummy}"
 
 echo "[INFO] Running QLASS + terminal-only memory correction."
-CUDA_VISIBLE_DEVICES="${WORKER_GPU}" python qlass/q_guided_inference.py \
+CUDA_VISIBLE_DEVICES="${WORKER_GPU}" "${QLASS_PYTHON}" qlass/q_guided_inference.py \
   --agent_config "${AGENT_CONFIG}" \
   --agent_path qlass/configs/model/ \
   --qnet_path "${QNET_PATH}" \
