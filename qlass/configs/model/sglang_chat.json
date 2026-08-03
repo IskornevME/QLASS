@@ -1,0 +1,21 @@
+{
+  "agent_class": "SGLangChatAgent",
+  "config": {
+    "server_address": "http://localhost:21003",
+    "model_name": "",
+    "tokenizer_path": null,
+    "max_new_tokens": 256,
+    "temperature": 0.7,
+    "top_p": 0.8,
+    "top_k": 20,
+    "min_p": 0.0,
+    "presence_penalty": 0.0,
+    "num_samples": 1,
+    "max_prompt_tokens": 30000,
+    "keep_first_n": 3,
+    "min_tail_msgs": 4,
+    "request_timeout": 300,
+    "response_format_reminder": "Your response must contain exactly one action and follow this format:\nThought: <brief reasoning>\nAction: <one valid environment action>\nDo not output text after the Action line.",
+    "chat_template_kwargs": {}
+  }
+}
