@@ -642,6 +642,7 @@ class AlfWorldCorrectionMemory:
         observation: str,
         previous_actions: Sequence[str],
         inventory: str = "",
+        min_episode_final_reward: Optional[float] = None,
     ) -> Dict[str, Any]:
         """Retrieve similar stored steps using ALFWorld JitRL logic.
 
@@ -659,6 +660,12 @@ class AlfWorldCorrectionMemory:
         Only records above the current effective threshold are returned as
         neighbors.
         """
+
+        if min_episode_final_reward is not None:
+            min_episode_final_reward = self._validate_probability(
+                "min_episode_final_reward",
+                min_episode_final_reward,
+            )
 
         normalized_previous_actions = [
             self.normalize_action(action)
@@ -682,12 +689,30 @@ class AlfWorldCorrectionMemory:
         query_history_tokens = self._tokenize(query_trajectory_context)
         query_state_tokens = self._tokenize(query_current_env_info)
 
+        num_valid_memory_steps = 0
+        num_quality_eligible_memory_steps = 0
+        num_filtered_by_quality_gate = 0
+
         matches: List[Dict[str, Any]] = []
 
         for stored_step in self._steps:
 
             if stored_step.action == INVALID_ACTION_COMMAND:
                 continue
+
+            num_valid_memory_steps += 1
+
+            if (
+                min_episode_final_reward is not None
+                and (
+                    stored_step.episode_final_reward + 1e-12
+                    < min_episode_final_reward
+                )
+            ):
+                num_filtered_by_quality_gate += 1
+                continue
+
+            num_quality_eligible_memory_steps += 1
 
             history_similarity = self._multiset_jaccard(
                 query_history_tokens,
@@ -723,6 +748,9 @@ class AlfWorldCorrectionMemory:
                     "history_similarity": history_similarity,
                     "state_similarity": state_similarity,
                     "episode_success": stored_step.episode_success,
+                    "episode_final_reward": (
+                        stored_step.episode_final_reward
+                    ),
                 }
             )
 
@@ -755,6 +783,14 @@ class AlfWorldCorrectionMemory:
             "query_trajectory_context": query_trajectory_context,
             "query_current_env_info": query_current_env_info,
             "memory_size": len(self._steps),
+            "num_valid_memory_steps": num_valid_memory_steps,
+            "min_episode_final_reward": min_episode_final_reward,
+            "num_quality_eligible_memory_steps": (
+                num_quality_eligible_memory_steps
+            ),
+            "num_filtered_by_quality_gate": (
+                num_filtered_by_quality_gate
+            ),
             "base_similarity_threshold": self.similarity_threshold,
             "effective_similarity_threshold": effective_threshold,
             "num_above_threshold": len(above_threshold),
@@ -929,6 +965,7 @@ class AlfWorldCorrectionMemory:
         existing_candidate_actions: Sequence[str],
         inventory: str = "",
         min_mean_return: float = 1e-12,
+        min_episode_final_reward: float = 0.0,
         max_actions: int = 2,  # сколько максимум кандидатов добавляем
         max_per_canonical: int = 1,  # сколько примеров на канон мы добавляем в кандидаты 
     ) -> Dict[str, Any]:
@@ -943,6 +980,9 @@ class AlfWorldCorrectionMemory:
             observation=observation,
             previous_actions=previous_actions,
             inventory=inventory,
+            min_episode_final_reward=(
+                min_episode_final_reward
+            ),
         )
 
         neighbors = retrieval_result["neighbors"]
@@ -1065,6 +1105,22 @@ class AlfWorldCorrectionMemory:
 
         return {
             "retrieval": retrieval_result,
+            "quality_gate_min_episode_final_reward": (
+                min_episode_final_reward
+            ),
+            "num_memory_steps_before_quality_gate": (
+                retrieval_result["num_valid_memory_steps"]
+            ),
+            "num_memory_steps_after_quality_gate": (
+                retrieval_result[
+                    "num_quality_eligible_memory_steps"
+                ]
+            ),
+            "num_memory_steps_filtered_by_quality_gate": (
+                retrieval_result[
+                    "num_filtered_by_quality_gate"
+                ]
+            ),
             "num_positive_patterns": len(positive_patterns),
             "positive_patterns": positive_patterns[:10],
             "augmented_actions": augmented_actions,

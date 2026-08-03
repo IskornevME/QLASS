@@ -102,6 +102,7 @@ ENABLE_MEMORY_ACTION_AUGMENTATION="${ENABLE_MEMORY_ACTION_AUGMENTATION:-0}"
 MEMORY_MAX_AUGMENTED_ACTIONS="${MEMORY_MAX_AUGMENTED_ACTIONS:-2}"
 MEMORY_AUG_MAX_PER_CANONICAL="${MEMORY_AUG_MAX_PER_CANONICAL:-1}"
 MEMORY_AUGMENTATION_MIN_MEAN_RETURN="${MEMORY_AUGMENTATION_MIN_MEAN_RETURN:-1e-12}"
+MEMORY_AUGMENTATION_MIN_EPISODE_FINAL_REWARD="${MEMORY_AUGMENTATION_MIN_EPISODE_FINAL_REWARD:-0.0}"
 MEMORY_AUGMENTED_ACTION_FORMAT="${MEMORY_AUGMENTED_ACTION_FORMAT:-retrieved_thought_exact_only}"
 MEMORY_REWARD_MODE="${MEMORY_REWARD_MODE:-terminal_only}"
 
@@ -111,7 +112,7 @@ else
   AUG_TAG="no_aug"
 fi
 
-RUN_TAG="${DATA_PREFIX}_bon${BON}_traj${N_TRAJS}_steps${MAX_STEPS}_${SPLIT}_run_${RUN_ID}_reward${MEMORY_REWARD_MODE}_lambda${MEMORY_WEIGHT}_gamma${MEMORY_GAMMA}_k${MEMORY_TOP_K}_thr${MEMORY_THRESHOLD}_${MEMORY_SCOPE}_${TERMINAL_TAG}_${AUG_TAG}"
+RUN_TAG="${DATA_PREFIX}_bon${BON}_traj${N_TRAJS}_steps${MAX_STEPS}_${SPLIT}_run_${RUN_ID}_reward${MEMORY_REWARD_MODE}_episodegate${MEMORY_AUGMENTATION_MIN_EPISODE_FINAL_REWARD}_lambda${MEMORY_WEIGHT}_gamma${MEMORY_GAMMA}_k${MEMORY_TOP_K}_thr${MEMORY_THRESHOLD}_${MEMORY_SCOPE}_${TERMINAL_TAG}_${AUG_TAG}"
 OUT_DIR="${OUT_DIR:-data/train/${TASK}/${SFT_MODEL_NAME}/q_correction_memory_without_perturb/${RUN_TAG}/}"
 MEMORY_DIR="${MEMORY_DIR:-${OUT_DIR}/memory}"
 MEMORY_LOG_FILE="${MEMORY_LOG_FILE:-${OUT_DIR}/${SLICE_ID}of${SLICE_NUM}_slices_bon_memory_correction_decisions.jsonl}"
@@ -160,6 +161,7 @@ if [[
     --memory_aug_max_per_canonical "${MEMORY_AUG_MAX_PER_CANONICAL}"
     --memory_augmentation_min_mean_return "${MEMORY_AUGMENTATION_MIN_MEAN_RETURN}"
     --memory_augmented_action_format "${MEMORY_AUGMENTED_ACTION_FORMAT}"
+    --memory_augmentation_min_episode_final_reward "${MEMORY_AUGMENTATION_MIN_EPISODE_FINAL_REWARD}"
   )
 fi
 
@@ -179,6 +181,7 @@ echo "[CONFIG] Memory scope:    ${MEMORY_SCOPE}; reset=${RESET_MEMORY}; dynamic_
 echo "[CONFIG] Terminal success override: ${PREFER_TERMINAL_SUCCESS}"
 echo "[CONFIG] Memory action augmentation: ${ENABLE_MEMORY_ACTION_AUGMENTATION}; max_aug=${MEMORY_MAX_AUGMENTED_ACTIONS}; max_per_canonical=${MEMORY_AUG_MAX_PER_CANONICAL}; min_return=${MEMORY_AUGMENTATION_MIN_MEAN_RETURN}"
 echo "[CONFIG] Memory augmented action format: ${MEMORY_AUGMENTED_ACTION_FORMAT}"
+echo "[CONFIG] Augmentation episode quality gate: ${MEMORY_AUGMENTATION_MIN_EPISODE_FINAL_REWARD}"
 echo "[CONFIG] Max tasks:       ${MAX_TASKS:-all}"
 
 # ---------------------------------------------------------------------------

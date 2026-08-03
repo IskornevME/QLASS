@@ -801,6 +801,12 @@ def main(args):
         if args.memory_weight < 0.0:
             raise ValueError("--memory_weight must be non-negative.")
 
+        if not (0.0 <= args.memory_augmentation_min_episode_final_reward <= 1.0):
+            raise ValueError(
+                "--memory_augmentation_min_episode_final_reward "
+                "must be in the range [0, 1]."
+            )
+
         from qlass.alfworld_correction_memory import AlfWorldCorrectionMemory
 
         memory_dir = args.memory_dir or os.path.join(
@@ -854,6 +860,18 @@ def main(args):
                 "prefer_terminal_success": args.prefer_terminal_success,
                 "memory_augmented_action_format": args.memory_augmented_action_format,
                 "memory_initial_stats": correction_memory.stats(),
+                "memory_augmentation_min_mean_return": (
+                    args.memory_augmentation_min_mean_return
+                ),
+                "memory_augmentation_min_episode_final_reward": (
+                    args.memory_augmentation_min_episode_final_reward
+                ),
+                "memory_max_augmented_actions": (
+                    args.memory_max_augmented_actions
+                ),
+                "memory_aug_max_per_canonical": (
+                    args.memory_aug_max_per_canonical
+                ),
             },
         )
         logger.info(
@@ -1166,6 +1184,9 @@ def main(args):
                             ],
                             inventory=inventory_before_action,
                             min_mean_return=args.memory_augmentation_min_mean_return,
+                            min_episode_final_reward=(
+                                args.memory_augmentation_min_episode_final_reward
+                            ),
                             max_actions=args.memory_max_augmented_actions,
                             max_per_canonical=args.memory_aug_max_per_canonical,
                         )
@@ -1520,11 +1541,47 @@ def main(args):
                                 "num_augmented_candidates": num_augmented,
                                 "selected_is_augmented": selected_is_augmented,
                                 "selection_changed_by_augmentation": selection_changed_by_augmentation_step,
-                                "augmentation_result": None if augmentation_result is None else {
-                                    "num_positive_patterns": augmentation_result["num_positive_patterns"],
-                                    "augmented_actions": augmentation_result["augmented_actions"],
-                                    "positive_patterns": augmentation_result["positive_patterns"],
-                                },
+                                "augmentation_result": (
+                                    None
+                                    if augmentation_result is None
+                                    else {
+                                        "quality_gate_min_episode_final_reward": (
+                                            augmentation_result[
+                                                "quality_gate_min_episode_final_reward"
+                                            ]
+                                        ),
+                                        "num_memory_steps_before_quality_gate": (
+                                            augmentation_result[
+                                                "num_memory_steps_before_quality_gate"
+                                            ]
+                                        ),
+                                        "num_memory_steps_after_quality_gate": (
+                                            augmentation_result[
+                                                "num_memory_steps_after_quality_gate"
+                                            ]
+                                        ),
+                                        "num_memory_steps_filtered_by_quality_gate": (
+                                            augmentation_result[
+                                                "num_memory_steps_filtered_by_quality_gate"
+                                            ]
+                                        ),
+                                        "num_positive_patterns": (
+                                            augmentation_result[
+                                                "num_positive_patterns"
+                                            ]
+                                        ),
+                                        "augmented_actions": (
+                                            augmentation_result[
+                                                "augmented_actions"
+                                            ]
+                                        ),
+                                        "positive_patterns": (
+                                            augmentation_result[
+                                                "positive_patterns"
+                                            ]
+                                        ),
+                                    }
+                                ),
                             },
                         )
                         if selection_changed_by_memory:
@@ -2084,6 +2141,19 @@ if __name__ == "__main__":
         default=1e-12,
         help="Minimum mean memory return required to add an action pattern.",
     )
+
+    parser.add_argument(
+        "--memory_augmentation_min_episode_final_reward",
+        type=float,
+        default=0.0,
+        help=(
+            "Use an episode as a source of memory-augmented "
+            "actions only when its final reward is at least "
+            "this value. Applied before similarity top-k "
+            "truncation and only to action augmentation."
+        ),
+    )
+
     parser.add_argument(
         "--memory_augmented_action_format",
         type=str,
