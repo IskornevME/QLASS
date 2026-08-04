@@ -220,6 +220,7 @@ echo "[INFO] Running QLASS + terminal-only memory correction."
 CUDA_VISIBLE_DEVICES="${WORKER_GPU}" "${QLASS_PYTHON}" qlass/q_guided_inference.py \
   --agent_config "${AGENT_CONFIG}" \
   --agent_path qlass/configs/model/ \
+  --critic_backend qnet \
   --qnet_path "${QNET_PATH}" \
   --exp_name "${EXP_NAME}" \
   --exp_path qlass/configs/task/ \

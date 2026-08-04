@@ -448,6 +448,90 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
     return result if np.isfinite(result) else default
 
 
+def _score_candidate_base(
+    *,
+    critic_backend: str,
+    new_state: Any,
+    candidate_id: int,
+    args: argparse.Namespace,
+    qnet: Optional[Any],
+    qnet_tokenizer: Optional[Any],
+    llm_critic: Optional[Any],
+) -> tuple[
+    float,
+    str,
+    Optional[Dict[str, Any]],
+]:
+    """Score one candidate using the configured base critic."""
+
+    # Preserve original QLASS terminal handling.
+    if new_state.finished:
+        return (
+            _safe_float(
+                new_state.reward
+            ),
+            "environment_terminal_reward",
+            None,
+        )
+
+    if critic_backend == "qnet":
+        if (
+            qnet is None
+            or qnet_tokenizer is None
+        ):
+            raise RuntimeError(
+                "QNet backend is not initialized."
+            )
+
+        score = float(
+            evaluate_trajs_qnet_v2(
+                qnet,
+                qnet_tokenizer,
+                new_state,
+                batch_size=1,
+                disable_tqdm=True,
+                model_name=args.model_name,
+                debug=args.debug,
+            )[0]
+        )
+
+        return score, "qnet", None
+
+    if critic_backend == "llm_judge":
+        if llm_critic is None:
+            raise RuntimeError(
+                "LLM critic is not initialized."
+            )
+
+        result = (
+            llm_critic.score_candidate(
+                state_action_conversation=(
+                    new_state.to_dict()[
+                        "conversations"
+                    ]
+                ),
+                candidate_id=candidate_id,
+                finished=False,
+            )
+        )
+
+        return (
+            float(result["score"]),
+            "llm_judge",
+            result,
+        )
+
+    if critic_backend == "none":
+        # Valid only for a single candidate,
+        # which was checked during initialization.
+        return 0.0, "none", None
+
+    raise ValueError(
+        f"Unknown critic backend: "
+        f"{critic_backend!r}"
+    )
+
+
 def _extract_executed_assistant_msgs(
     state: Any,
 ) -> List[str]:
@@ -656,43 +740,130 @@ def main(args):
     if args.max_steps is not None and args.max_steps <= 0:
         raise ValueError("--max_steps must be a positive integer.")
 
-    args.model_name_or_path = args.qnet_path
-    args.low_cpu_mem_usage = False
-    args.use_flash_attn = True
-    qnet = QNet.from_pretrained(args.qnet_path,None,args)
-    qnet = qnet.to("cuda")
-    qnet.device = torch.device("cuda")
+    if args.enable_memory_action_augmentation and not args.enable_memory_correction:
+        raise ValueError(
+            "--enable_memory_action_augmentation requires --enable_memory_correction."
+        )
+    if args.critic_backend == "none" and args.enable_memory_correction and args.memory_weight != 0.0:
+        raise ValueError(
+            "Memory score correction requires a base critic."
+        )
 
-    qnet.mode = "final"
-    qnet.eval()
+    with open(os.path.join(args.agent_path, f"{args.agent_config}.json")) as config_file:
+        agent_config: Dict[str, Any] = json.load(config_file)
 
-    print("loaded qnet successfully")
-    # from transformers import AutoTokenizer
-    # tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path,
-    #                                             model_max_length=4096,
-    #                                             use_fast=False)
-    # Tokenizer MUST match the SFT model (same chat template/tokenizer as action generator)
-    from transformers import AutoTokenizer
-    # Resolve tokenizer path: explicit arg > agent_config tokenizer_path > args.model_name
-    with open(os.path.join(args.agent_path, f"{args.agent_config}.json")) as f:
-        agent_config: Dict[str, Any] = json.load(f)
-    tokenizer_path = args.tokenizer_path or agent_config.get("config", {}).get("tokenizer_path") or args.model_name
-    if tokenizer_path is not None:
-        agent_config["config"]["tokenizer_path"] = tokenizer_path
+    policy_config = agent_config["config"]
 
-    tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, model_max_length=4096, use_fast=False)
-    if tokenizer.pad_token != tokenizer.unk_token:
-        tokenizer.pad_token = tokenizer.unk_token
+    policy_overrides = {
+        "server_address": args.policy_server_address,
+        "model_name": args.model_name,
+        "tokenizer_path": args.tokenizer_path,
+        "max_prompt_tokens": args.policy_max_prompt_tokens,
+        "keep_first_n": (
+            args.policy_keep_first_n
+        ),
+        "min_tail_msgs": (
+            args.policy_min_tail_msgs
+        ),
+        "max_new_tokens": (
+            args.policy_max_new_tokens
+        ),
+        "temperature": (
+            args.policy_temperature
+        ),
+        "top_p": args.policy_top_p,
+        "top_k": args.policy_top_k,
+        "min_p": args.policy_min_p,
+        "presence_penalty": (
+            args.policy_presence_penalty
+        ),
+    }
+
+    for key, value in policy_overrides.items():
+        if value is not None:
+            policy_config[key] = value
+
+
+    qnet = None
+    qnet_tokenizer = None
+    llm_critic = None
+
+    if args.critic_backend == "qnet":
+        if not args.qnet_path:
+            raise ValueError("--qnet_path is required when --critic_backend=qnet.")
+
+        args.model_name_or_path = args.qnet_path
+        args.low_cpu_mem_usage = False
+        args.use_flash_attn = True
+
+        qnet = QNet.from_pretrained(args.qnet_path, None, args)
+        qnet = qnet.to("cuda")
+        qnet.device = torch.device("cuda")
+        qnet.mode = "final"
+        qnet.eval()
+
+        print("loaded qnet successfully")
+
+        from transformers import AutoTokenizer
+
+        qnet_tokenizer_path = (args.tokenizer_path or agent_config["config"].get("tokenizer_path")
+            or args.model_name
+        )
+
+        qnet_tokenizer = AutoTokenizer.from_pretrained(qnet_tokenizer_path, model_max_length=4096, use_fast=False)
+
+        # Preserve the original QLASS behavior
+        # only inside the QNet branch.
+        if qnet_tokenizer.pad_token != qnet_tokenizer.unk_token:
+            qnet_tokenizer.pad_token = qnet_tokenizer.unk_token
+
+        qnet._qnet_max_prompt_tokens = args.qnet_max_prompt_tokens
+        qnet._qnet_keep_first_n = args.qnet_keep_first_n
+        qnet._qnet_min_tail_msgs = args.qnet_min_tail_msgs
+    elif args.critic_backend == "llm_judge":
+        from qlass.critics import SGLangLLMCritic
+
+        critic_server_address = args.critic_server_address or agent_config["config"]["server_address"]
+        critic_model_name = args.critic_model_name or agent_config["config"]["model_name"]
+        critic_tokenizer_path = args.critic_tokenizer_path or agent_config["config"].get("tokenizer_path") or critic_model_name
+
+        llm_critic = SGLangLLMCritic(
+            server_address=critic_server_address,
+            model_name=critic_model_name,
+            tokenizer_path=critic_tokenizer_path,
+            api_model_name=args.critic_api_model_name,
+            max_prompt_tokens=args.critic_max_prompt_tokens,
+            max_new_tokens=args.critic_max_new_tokens,
+            temperature=args.critic_temperature,
+            top_p=args.critic_top_p,
+            top_k=args.critic_top_k,
+            keep_first_n=args.critic_keep_first_n,
+            min_tail_msgs=args.critic_min_tail_msgs,
+            failure_mode=args.critic_failure_mode,
+            neutral_score=args.critic_neutral_score,
+            max_parse_attempts=args.critic_max_parse_attempts,
+            request_timeout=args.critic_request_timeout,
+            retry_delay_seconds=args.critic_retry_delay_seconds,
+            chat_template_kwargs={},
+        )
+    elif args.critic_backend == "none":
+        if args.best_of_N != 1:
+            raise ValueError(
+                "--critic_backend=none requires --best_of_N=1 because there is no score for ranking candidates."
+            )
+
+        if args.enable_memory_action_augmentation:
+            raise ValueError(
+                "Action augmentation requires a critic to rank policy and memory candidates."
+            )
+
+
     random.seed(42)
 
     with open(os.path.join(args.exp_path, f"{args.exp_config}.json")) as f:
         exp_config: Dict[str, Any] = json.load(f)
     # with open(os.path.join(args.agent_path, f"{args.agent_config}.json")) as f:
     #     agent_config: Dict[str, Any] = json.load(f)
-        
-    if args.model_name is not None:
-        agent_config['config']['model_name'] = args.model_name
-        agent_config['config']['batch_size'] = args.eval_batch_size
 
     agent_config["config"].update(
         {
@@ -708,11 +879,6 @@ def main(args):
         }
     )
 
-    # Attach QNet trimming caps to the model instance (used inside evaluate_trajs_qnet_v2)
-    qnet._qnet_max_prompt_tokens = args.qnet_max_prompt_tokens
-    qnet._qnet_keep_first_n = args.qnet_keep_first_n
-    qnet._qnet_min_tail_msgs = args.qnet_min_tail_msgs
-        
     env_config = exp_config["env_config"]
     if args.max_steps is not None:
         env_config["max_steps"] = int(args.max_steps)
@@ -854,6 +1020,19 @@ def main(args):
                 "prefer_terminal_success": args.prefer_terminal_success,
                 "memory_augmented_action_format": args.memory_augmented_action_format,
                 "memory_initial_stats": correction_memory.stats(),
+
+                "critic_backend": args.critic_backend,
+                "critic_model_name": args.critic_model_name,
+                "critic_max_prompt_tokens": args.critic_max_prompt_tokens,
+                "critic_temperature": args.critic_temperature,
+                "critic_failure_mode": args.critic_failure_mode,
+                "policy_agent_class": agent_config["agent_class"],
+                "policy_config": {
+                    key: value
+                    for key, value
+                    in agent_config["config"].items()
+                    if key != "api_key"
+                },
             },
         )
         logger.info(
@@ -1086,30 +1265,21 @@ def main(args):
 
                         observation_after_action, new_state = env.step(raw_action)
 
-                        # Keep QLASS scoring unchanged. A terminal action has
-                        # an observed environment value; any non-terminal
-                        # action is evaluated by QNet.
-                        if new_state.finished:
-                            base_score = _safe_float(new_state.reward)
-                            score_source = "environment_terminal_reward"
-                        else:
-                            base_score = float(
-                                evaluate_trajs_qnet_v2(
-                                    qnet,
-                                    tokenizer,
-                                    new_state,
-                                    batch_size=1,
-                                    disable_tqdm=True,
-                                    model_name=args.model_name,
-                                    debug=args.debug,
-                                )[0]
+                        base_score, score_source, critic_diagnostics = _score_candidate_base(
+                            critic_backend=args.critic_backend,
+                            new_state=new_state,
+                            candidate_id=idx,
+                            args=args,
+                            qnet=qnet,
+                            qnet_tokenizer=qnet_tokenizer,
+                            llm_critic=llm_critic,
+                        )
+
+                        if i < 2 and n_turn < 3:
+                            print(
+                                f"[DBG] idx={idx} Q={base_score:.4f} "
+                                f"action={raw_action.splitlines()[-1][:120]}"
                             )
-                            score_source = "qnet"
-                            if i < 2 and n_turn < 3:
-                                print(
-                                    f"[DBG] idx={idx} Q={base_score:.4f} "
-                                    f"action={raw_action.splitlines()[-1][:120]}"
-                                )
 
                         candidate_records.append(
                             {
@@ -1118,6 +1288,7 @@ def main(args):
                                 "raw_action": raw_action,
                                 "action_command": action_command,
                                 "observation_after_action": observation_after_action,
+                                "critic_diagnostics": critic_diagnostics,
                                 "base_score": base_score,
                                 "corrected_score": base_score,
                                 "score_source": score_source,
@@ -1199,22 +1370,17 @@ def main(args):
 
                             observation_after_action, new_state = env.step(raw_action)
 
-                            if new_state.finished:
-                                base_score = _safe_float(new_state.reward)
-                                score_source = "environment_terminal_reward"
-                            else:
-                                base_score = float(
-                                    evaluate_trajs_qnet_v2(
-                                        qnet,
-                                        tokenizer,
-                                        new_state,
-                                        batch_size=1,
-                                        disable_tqdm=True,
-                                        model_name=args.model_name,
-                                        debug=args.debug,
-                                    )[0]
-                                )
-                                score_source = "qnet"
+                            candidate_id = len(candidate_records)
+
+                            base_score, score_source, critic_diagnostics = _score_candidate_base(
+                                critic_backend=args.critic_backend,
+                                new_state=new_state,
+                                candidate_id=candidate_id,
+                                args=args,
+                                qnet=qnet,
+                                qnet_tokenizer=qnet_tokenizer,
+                                llm_critic=llm_critic,
+                            )
 
                             candidate_records.append(
                                 {
@@ -1223,6 +1389,8 @@ def main(args):
                                     "raw_action": raw_action,
                                     "action_command": action_command,
                                     "observation_after_action": observation_after_action,
+                                    "candidate_id": candidate_id,
+                                    "critic_diagnostics": critic_diagnostics,
                                     "base_score": base_score,
                                     "corrected_score": base_score,
                                     "score_source": score_source,
@@ -1330,6 +1498,13 @@ def main(args):
                         args.prefer_terminal_success
                         and successful_candidate_indices
                     )
+
+                    backend_selection_reason = {
+                        "qnet": "qnet_argmax",
+                        "llm_judge": "llm_judge_argmax",
+                        "none": "single_candidate",
+                    }[args.critic_backend]
+
                     if terminal_success_override_applied:
                         selected_idx = max(
                             successful_candidate_indices,
@@ -1348,14 +1523,14 @@ def main(args):
                             selected_reason = (
                                 "corrected_argmax"
                                 if correction_memory is not None
-                                else "qnet_argmax"
+                                else backend_selection_reason
                             )
                     elif args.sample_mode == "bon":
                         selected_idx = corrected_best_idx
                         selected_reason = (
                             "corrected_argmax"
                             if correction_memory is not None
-                            else "qnet_argmax"
+                            else backend_selection_reason
                         )
                     else:
                         raise NotImplementedError(
@@ -1458,16 +1633,19 @@ def main(args):
                             "action": record["raw_action"],
                             "value": record["base_score"],
                             "base_score": record["base_score"],
+                            "score_source": record["score_source"],
                             "corrected_score": record["corrected_score"],
                             "memory_correction": record["memory_correction"],
                             "memory_normalized_advantage": record[
                                 "memory_normalized_advantage"
                             ],
                             "memory_match_count": record["memory_match_count"],
+                            "candidate_source": record["candidate_source"],
+                            "critic_diagnostics": record.get("critic_diagnostics"),
                             "selected": record["selected"],
                         }
                         for record in candidate_records
-                        if record["score_source"] == "qnet"
+                        if record["score_source"] != "environment_terminal_reward"
                     ]
                     action_value_list.append(action_value_dict)
 
@@ -1548,6 +1726,7 @@ def main(args):
                         reward=new_state.reward,
                     )
                     new_node.q_value = float(selected_record["base_score"])
+                    new_node.score_source = selected_record["score_source"]
                     new_node.corrected_score = float(
                         selected_record["corrected_score"]
                     )
@@ -1576,6 +1755,7 @@ def main(args):
                             "env_reward": _safe_float(new_state.reward),
                             "env_reward_missing": new_state.reward is None,
                             "base_q_score": selected_record["base_score"],
+                            "base_score_source": selected_record["score_source"],
                             "memory_normalized_advantage": selected_record[
                                 "memory_normalized_advantage"
                             ],
@@ -2095,6 +2275,157 @@ if __name__ == "__main__":
             "current admissible command exactly matches a positive retrieved memory action; "
             "otherwise it falls back to generic_thought."
         ),
+    )
+
+    parser.add_argument(
+        "--policy_server_address",
+        type=str,
+        default=None,
+    )
+
+    parser.add_argument(
+        "--policy_max_new_tokens",
+        type=int,
+        default=None,
+    )
+
+    parser.add_argument(
+        "--policy_temperature",
+        type=float,
+        default=None,
+    )
+
+    parser.add_argument(
+        "--policy_top_p",
+        type=float,
+        default=None,
+    )
+
+    parser.add_argument(
+        "--policy_top_k",
+        type=int,
+        default=None,
+    )
+
+    parser.add_argument(
+        "--policy_min_p",
+        type=float,
+        default=None,
+    )
+
+    parser.add_argument(
+        "--policy_presence_penalty",
+        type=float,
+        default=None,
+    )
+
+    parser.add_argument(
+        "--critic_backend",
+        type=str,
+        choices=["qnet", "llm_judge", "none",],
+        default="qnet",
+        help=(
+            "qnet: original trained QLASS critic; "
+            "llm_judge: independent prompted LLM critic; "
+            "none: no critic, allowed only with best_of_N=1 and without action augmentation."
+        ),
+    )
+
+    parser.add_argument(
+        "--critic_server_address",
+        type=str,
+        default=None,
+    )
+
+    parser.add_argument(
+        "--critic_model_name",
+        type=str,
+        default=None,
+    )
+
+    parser.add_argument(
+        "--critic_api_model_name",
+        type=str,
+        default=None,
+    )
+
+    parser.add_argument(
+        "--critic_tokenizer_path",
+        type=str,
+        default=None,
+    )
+
+    parser.add_argument(
+        "--critic_max_prompt_tokens",
+        type=int,
+        default=16000,
+    )
+
+    parser.add_argument(
+        "--critic_max_new_tokens",
+        type=int,
+        default=64,
+    )
+
+    parser.add_argument(
+        "--critic_temperature",
+        type=float,
+        default=0.0,
+    )
+
+    parser.add_argument(
+        "--critic_top_p",
+        type=float,
+        default=1.0,
+    )
+
+    parser.add_argument(
+        "--critic_top_k",
+        type=int,
+        default=-1,
+    )
+
+    parser.add_argument(
+        "--critic_keep_first_n",
+        type=int,
+        default=3,
+    )
+
+    parser.add_argument(
+        "--critic_min_tail_msgs",
+        type=int,
+        default=4,
+    )
+
+    parser.add_argument(
+        "--critic_failure_mode",
+        type=str,
+        choices=["neutral", "error"],
+        default="neutral",
+    )
+
+    parser.add_argument(
+        "--critic_neutral_score",
+        type=float,
+        default=0.5,
+    )
+
+    parser.add_argument(
+        "--critic_max_parse_attempts",
+        type=int,
+        default=3,
+    )
+
+    parser.add_argument(
+        "--critic_request_timeout",
+        type=float,
+        default=300.0,
+    )
+
+    parser.add_argument(
+        "--critic_retry_delay_seconds",
+        type=float,
+        default=1.0,
     )
 
     args = parser.parse_args()
