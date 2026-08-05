@@ -44,7 +44,7 @@ from eval_agent.prompt.templates import *
 from eval_agent.prompt.instructions import *
 
 logger = logging.getLogger("agent_frame")
-openai.api_key = os.environ["OPENAI_API_KEY"]
+openai.api_key = os.environ.get("OPENAI_API_KEY", "dummy")
 model_config = lm_config.LMConfig(provider="openai_chat", model="gpt-3.5-turbo")
 eval_model_config = lm_config.LMConfig(provider="openai_chat", model="gpt-4-1106-preview")
 engine = 'gpt-3.5-turbo'
@@ -1384,12 +1384,11 @@ def main(args):
 
                             candidate_records.append(
                                 {
-                                    "candidate_id": len(candidate_records),
+                                    "candidate_id": candidate_id,
                                     "state": new_state,
                                     "raw_action": raw_action,
                                     "action_command": action_command,
                                     "observation_after_action": observation_after_action,
-                                    "candidate_id": candidate_id,
                                     "critic_diagnostics": critic_diagnostics,
                                     "base_score": base_score,
                                     "corrected_score": base_score,
