@@ -41,14 +41,33 @@ fi
 SGLANG_PYTHON="${SGLANG_PYTHON:-/home/m.iskornev/miniforge3/envs/qlass_qwen_server/bin/python}"
 QLASS_PYTHON="${QLASS_PYTHON:-/home/m.iskornev/miniforge3/envs/my_env/bin/python}"
 
+
 # -----------------------------------------------------------------------------
-# Server settings.
-# Actor and prompted critic use the same served Qwen checkpoint.
-# The QLASS client does not load a local neural model in llm_judge/none modes, so WORKER_GPU is empty by default and CUDA is hidden from the client process.
-# But for run with Qnet and Qwen as actor it has to be changed.
+# GPU allocation.
+#
+# llm_judge:
+#   GPU SERVER_GPU: Qwen actor + prompted Qwen critic via one SGLang server.
+#   QLASS client does not load a neural model locally.
+#
+# none:
+#   GPU SERVER_GPU: Qwen actor via SGLang.
+#   QLASS client does not load a neural model locally.
+#
+# qnet:
+#   GPU SERVER_GPU: Qwen actor via SGLang.
+#   GPU WORKER_GPU: original trained Llama QNet loaded locally by q_guided_inference.py.
 # -----------------------------------------------------------------------------
 SERVER_GPU="${SERVER_GPU:-0}"
-WORKER_GPU="${WORKER_GPU:-}"
+# Preserve the old behavior for actor-only and LLM-judge runs: no local GPU is exposed to q_guided_inference.py.
+# For QNet, use a second physical GPU by default.
+if [[ -z "${WORKER_GPU+x}" ]]; then
+  if [[ "${CRITIC_BACKEND}" == "qnet" ]]; then
+    WORKER_GPU="1"
+  else
+    WORKER_GPU=""
+  fi
+fi
+
 SGLANG_PORT="${SGLANG_PORT:-21003}"
 POLICY_SERVER_ADDRESS="${POLICY_SERVER_ADDRESS:-http://127.0.0.1:${SGLANG_PORT}}"
 KEEP_SERVER_ALIVE="${KEEP_SERVER_ALIVE:-0}"
@@ -122,13 +141,43 @@ case "${CRITIC_BACKEND}" in
     fi
     ;;
   qnet)
-    echo "[ERROR] This Qwen launch script has no trained QNet. Use CRITIC_BACKEND=llm_judge or none." >&2
+  if [[ -z "${WORKER_GPU}" ]]; then
+    echo \
+      "[ERROR] CRITIC_BACKEND=qnet requires a non-empty WORKER_GPU." \
+      >&2
     exit 1
-    ;;
-  *)
-    echo "[ERROR] Unsupported CRITIC_BACKEND: ${CRITIC_BACKEND}" >&2
+  fi
+
+  if [[ "${SERVER_GPU}" == "${WORKER_GPU}" ]]; then
+    echo \
+      "[ERROR] Qwen actor and QNet critic must use different GPUs. " \
+      "Got SERVER_GPU=${SERVER_GPU} and WORKER_GPU=${WORKER_GPU}." \
+      >&2
     exit 1
-    ;;
+  fi
+
+  if [[ ! -d "${QNET_PATH}" ]]; then
+    echo \
+      "[ERROR] QNet checkpoint directory not found: ${QNET_PATH}" \
+      >&2
+    exit 1
+  fi
+
+  if [[ ! -d "${QNET_TOKENIZER_PATH}" ]]; then
+    echo \
+      "[ERROR] Llama QNet tokenizer directory not found: " \
+      "${QNET_TOKENIZER_PATH}" \
+      >&2
+    exit 1
+  fi
+
+  if [[ -z "${QNET_MODEL_NAME}" ]]; then
+    echo \
+      "[ERROR] QNET_MODEL_NAME must not be empty." \
+      >&2
+    exit 1
+  fi
+  ;;
 esac
 
 if [[ "${PREFER_TERMINAL_SUCCESS}" == "1" ]]; then
@@ -150,7 +199,15 @@ else
 fi
 
 RUN_TAG="${DATA_PREFIX}_${CRITIC_BACKEND}_bon${BON}_traj${N_TRAJS}_steps${MAX_STEPS}_${SPLIT}_run${RUN_ID}_${MEMORY_TAG}_${TERMINAL_TAG}_${AUG_TAG}"
-OUT_DIR="${OUT_DIR:-data/train/${TASK}/${POLICY_MODEL_NAME}/qwen_llm_critic/${RUN_TAG}/}"
+
+if [[ "${CRITIC_BACKEND}" == "qnet" ]]; then
+  RUN_FAMILY="qwen_llama_qnet"
+else
+  # Preserve the existing output location for llm_judge and actor-only runs.
+  RUN_FAMILY="qwen_llm_critic"
+fi
+
+OUT_DIR="${OUT_DIR:-data/train/${TASK}/${POLICY_MODEL_NAME}/${RUN_FAMILY}/${RUN_TAG}/}"
 case "${OUT_DIR}" in
   */) ;;
   *) OUT_DIR="${OUT_DIR}/" ;;
@@ -211,7 +268,6 @@ if [[ "${PREFER_TERMINAL_SUCCESS}" == "1" ]]; then
   SELECTION_ARGS+=(--prefer_terminal_success)
 fi
 
-# TODO: change for using QNet
 CRITIC_ARGS=(--critic_backend "${CRITIC_BACKEND}")
 if [[ "${CRITIC_BACKEND}" == "llm_judge" ]]; then
   CRITIC_ARGS+=(
@@ -235,6 +291,15 @@ if [[ "${CRITIC_BACKEND}" == "llm_judge" ]]; then
   if [[ -n "${CRITIC_API_MODEL_NAME:-}" ]]; then
     CRITIC_ARGS+=(--critic_api_model_name "${CRITIC_API_MODEL_NAME}")
   fi
+elif [[ "${CRITIC_BACKEND}" == "qnet" ]]; then
+  CRITIC_ARGS+=(
+    --qnet_path "${QNET_PATH}"
+    --qnet_tokenizer_path "${QNET_TOKENIZER_PATH}"
+    --qnet_model_name "${QNET_MODEL_NAME}"
+    --qnet_max_prompt_tokens "${QNET_MAX_PROMPT_TOKENS}"
+    --qnet_keep_first_n "${QNET_KEEP_FIRST_N}"
+    --qnet_min_tail_msgs "${QNET_MIN_TAIL_MSGS}"
+  )
 fi
 
 # q_guided_inference.py currently reads OPENAI_API_KEY at import time even
@@ -248,6 +313,12 @@ echo "[CONFIG] Benchmark:        ${BENCHMARK}"
 echo "[CONFIG] Policy model:     ${POLICY_MODEL_PATH}"
 echo "[CONFIG] Agent config:     ${AGENT_CONFIG}"
 echo "[CONFIG] Critic backend:   ${CRITIC_BACKEND}"
+if [[ "${CRITIC_BACKEND}" == "qnet" ]]; then
+  echo "[CONFIG] QNet checkpoint: ${QNET_PATH}"
+  echo "[CONFIG] QNet tokenizer:  ${QNET_TOKENIZER_PATH}"
+  echo "[CONFIG] QNet model name: ${QNET_MODEL_NAME}"
+  echo "[CONFIG] QNet GPU:        ${WORKER_GPU}"
+fi
 echo "[CONFIG] Server:           gpu=${SERVER_GPU}, tp=${SERVER_TP}, address=${POLICY_SERVER_ADDRESS}"
 echo "[CONFIG] Client GPU:       ${WORKER_GPU:-hidden}"
 echo "[CONFIG] BON / trajectories: ${BON} / ${N_TRAJS}"

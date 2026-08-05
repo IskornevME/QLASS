@@ -9,6 +9,36 @@
 : "${AGENT_CONFIG:=sglang_chat}"
 : "${CRITIC_BACKEND:=llm_judge}"
 
+# -----------------------------------------------------------------------------
+# Optional original QLASS critic.
+#
+# These variables are used only when CRITIC_BACKEND=qnet.
+# The actor still remains Qwen; the critic uses the original
+# Llama SFT tokenizer/template and trained QNet checkpoint.
+# -----------------------------------------------------------------------------
+
+: "${QNET_BASE_MODEL_NAME:=Llama-2-7b-chat-hf}"
+
+: "${QNET_SFT_MODEL_NAME:=${EXP_NAME}-${QNET_BASE_MODEL_NAME}-${TASK}-sft}"
+
+# May be overridden with a nested inference checkpoint, for example:
+# qlass-Llama-2-7b-chat-hf-alfworld-Q/infer-checkpoint-14382
+: "${QNET_CHECKPOINT_NAME:=${EXP_NAME}-${QNET_BASE_MODEL_NAME}-${TASK}-Q}"
+
+: "${QNET_PATH:=${MODEL_PATH%/}/${QNET_CHECKPOINT_NAME}}"
+
+# Match the tokenizer used when the original QNet was trained.
+: "${QNET_TOKENIZER_PATH:=${MODEL_PATH%/}/${QNET_SFT_MODEL_NAME}}"
+
+# Used by qlass.data_utils.get_chat_template().
+# This value must identify Llama-2 Chat rather than Qwen.
+: "${QNET_MODEL_NAME:=${QNET_SFT_MODEL_NAME}}"
+
+: "${QNET_MAX_PROMPT_TOKENS:=3800}"
+: "${QNET_KEEP_FIRST_N:=3}"
+: "${QNET_MIN_TAIL_MSGS:=4}"
+
+
 # Deployment context cap. This is deliberately smaller than the native
 # 262K context to reduce the SGLang KV-cache allocation.
 : "${SGLANG_CONTEXT_LENGTH:=32768}"

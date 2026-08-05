@@ -456,6 +456,7 @@ def _score_candidate_base(
     args: argparse.Namespace,
     qnet: Optional[Any],
     qnet_tokenizer: Optional[Any],
+    qnet_model_name: Optional[str],
     llm_critic: Optional[Any],
 ) -> tuple[
     float,
@@ -478,6 +479,7 @@ def _score_candidate_base(
         if (
             qnet is None
             or qnet_tokenizer is None
+            or not qnet_model_name
         ):
             raise RuntimeError(
                 "QNet backend is not initialized."
@@ -490,7 +492,7 @@ def _score_candidate_base(
                 new_state,
                 batch_size=1,
                 disable_tqdm=True,
-                model_name=args.model_name,
+                model_name=qnet_model_name,
                 debug=args.debug,
             )[0]
         )
@@ -786,6 +788,7 @@ def main(args):
 
     qnet = None
     qnet_tokenizer = None
+    qnet_model_name = None
     llm_critic = None
 
     if args.critic_backend == "qnet":
@@ -806,9 +809,23 @@ def main(args):
 
         from transformers import AutoTokenizer
 
-        qnet_tokenizer_path = (args.tokenizer_path or agent_config["config"].get("tokenizer_path")
+        qnet_tokenizer_path = (
+            args.qnet_tokenizer_path
+            # Backward-compatible fallback for the old Llama launcher.
+            or args.tokenizer_path
+            or agent_config["config"].get(
+                "tokenizer_path"
+            )
             or args.model_name
         )
+
+        if not qnet_tokenizer_path:
+            raise ValueError(
+                "Could not resolve the QNet tokenizer. "
+                "Pass --qnet_tokenizer_path explicitly."
+            )
+
+        qnet_model_name = args.qnet_model_name or qnet_tokenizer_path
 
         qnet_tokenizer = AutoTokenizer.from_pretrained(qnet_tokenizer_path, model_max_length=4096, use_fast=False)
 
@@ -1007,6 +1024,8 @@ def main(args):
                 "n_trajs": args.n_trajs,
                 "sample_mode": args.sample_mode,
                 "qnet_path": args.qnet_path,
+                "qnet_tokenizer_path": args.qnet_tokenizer_path,
+                "qnet_model_name": qnet_model_name,
                 "agent_model_name": args.model_name,
                 "memory_dir": memory_dir,
                 "memory_weight": args.memory_weight,
@@ -1272,6 +1291,7 @@ def main(args):
                             args=args,
                             qnet=qnet,
                             qnet_tokenizer=qnet_tokenizer,
+                            qnet_model_name=qnet_model_name,
                             llm_critic=llm_critic,
                         )
 
@@ -1379,6 +1399,7 @@ def main(args):
                                 args=args,
                                 qnet=qnet,
                                 qnet_tokenizer=qnet_tokenizer,
+                                qnet_model_name=qnet_model_name,
                                 llm_critic=llm_critic,
                             )
 
@@ -2100,9 +2121,19 @@ if __name__ == "__main__":
         default=3,
         help="Number of best trajectories to select.")
 
-    # --- Added: QNet scoring trimming caps (to match your SGLangAgent behavior) ---
     parser.add_argument("--tokenizer_path", type=str, default=None,
-                        help="Tokenizer/SFT model path. If not set, will use agent_config['config']['tokenizer_path'] or --model_name.")
+        help="Tokenizer path used by the policy actor. For SGLangChatAgent with Qwen this must point to the Qwen checkpoint.",
+    )
+    parser.add_argument("--qnet_tokenizer_path", type=str, default=None,
+        help="Tokenizer path used only for QNet scoring. For the original Llama QNet this should point to the corresponding Llama SFT policy checkpoint.",
+    )
+    parser.add_argument("--qnet_model_name", type=str, default=None,
+        help=(
+            "Model identifier used to select the QNet chat template during preprocessing. It must correspond to the model "
+            "on which QNet was trained, for example 'qlass-Llama-2-7b-chat-hf-alfworld-sft'. "
+            "If omitted, --qnet_tokenizer_path is used."
+        ),
+    )
     parser.add_argument("--qnet_max_prompt_tokens", type=int, default=3800,
                         help="Max prompt tokens for QNet scoring (message-level trimming).")
     parser.add_argument("--qnet_keep_first_n", type=int, default=3,
