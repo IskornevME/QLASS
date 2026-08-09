@@ -3,12 +3,17 @@ import json
 import os
 
 data_dir = './data/train/alfworld/'
-model_name = 'qlass-Llama-2-7b-chat-hf-alfworld-sft'
-inference_type = 'q_correction_memory_without_perturb'
+# model_name = 'qlass-Llama-2-7b-chat-hf-alfworld-sft'
+model_name = 'Qwen3-4B-Instruct-2507'
+# inference_type = 'q_correction_memory_without_perturb'
 # inference_type = 'q_without_perturb'
+# inference_type = 'qwen_llama_qnet'
+inference_type = 'qwen_llm_critic'
 # eval_name = 'debug_bon2_test_run_aug_per_task_same_hparams_lambda0.0_gamma0.97_k10_thr0.75_per_task_no_terminal_override_aug2_percanon1_retrieved_thought_exact_only'
-eval_name = 'debug_bon2_test_run_aug_only_0_lambda0.0_gamma0.97_k10_thr0.75_global_no_terminal_override_aug2_percanon1_retrieved_thought_exact_only'
+# eval_name = 'debug_bon2_test_run_aug_only_0_lambda0.0_gamma0.97_k10_thr0.75_global_no_terminal_override_aug2_percanon1_retrieved_thought_exact_only'
 # eval_name = 'debug_bon2_test_run_0'
+# eval_name = 'qwen_actor_llama_qnet_qnet_bon2_traj3_steps40_test_run0_no_memory_no_terminal_override_no_aug'
+eval_name = 'qwen_actor_qwen_llm_critic_llm_judge_bon2_traj3_steps40_test_run0_no_memory_no_terminal_override_no_aug'
 slice_num = 1
 file_list = []
 for i in range(slice_num):
