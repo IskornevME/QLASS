@@ -83,6 +83,9 @@ AGENT_CONFIG="${AGENT_CONFIG:-sglang}"
 # between different lambda/gamma/reward/override configurations.
 # ---------------------------------------------------------------------------
 MEMORY_WEIGHT="${MEMORY_WEIGHT:-0.0}"
+MEMORY_CORRECTION_MODE="${MEMORY_CORRECTION_MODE:-normalized_advantage}"
+MEMORY_CORRECTION_Q_MARGIN_THRESHOLD="${MEMORY_CORRECTION_Q_MARGIN_THRESHOLD:-0.02}"
+MEMORY_CORRECTION_MIN_EPISODE_FINAL_REWARD="${MEMORY_CORRECTION_MIN_EPISODE_FINAL_REWARD:-0.0}"
 MEMORY_GAMMA="${MEMORY_GAMMA:-0.97}"
 MEMORY_TOP_K="${MEMORY_TOP_K:-10}"
 MEMORY_THRESHOLD="${MEMORY_THRESHOLD:-0.75}"
@@ -112,7 +115,8 @@ else
   AUG_TAG="no_aug"
 fi
 
-RUN_TAG="${DATA_PREFIX}_bon${BON}_traj${N_TRAJS}_steps${MAX_STEPS}_${SPLIT}_run_${RUN_ID}_reward${MEMORY_REWARD_MODE}_episodegate${MEMORY_AUGMENTATION_MIN_EPISODE_FINAL_REWARD}_lambda${MEMORY_WEIGHT}_gamma${MEMORY_GAMMA}_k${MEMORY_TOP_K}_thr${MEMORY_THRESHOLD}_${MEMORY_SCOPE}_${TERMINAL_TAG}_${AUG_TAG}"
+CORR_TAG="corr${MEMORY_CORRECTION_MODE}_qmargin${MEMORY_CORRECTION_Q_MARGIN_THRESHOLD}_gate${MEMORY_CORRECTION_MIN_EPISODE_FINAL_REWARD}"
+RUN_TAG="${DATA_PREFIX}_bon${BON}_traj${N_TRAJS}_steps${MAX_STEPS}_${SPLIT}_run_${RUN_ID}_reward${MEMORY_REWARD_MODE}_${CORR_TAG}_lambda${MEMORY_WEIGHT}_gamma${MEMORY_GAMMA}_k${MEMORY_TOP_K}_thr${MEMORY_THRESHOLD}_${MEMORY_SCOPE}_${TERMINAL_TAG}_${AUG_TAG}"
 OUT_DIR="${OUT_DIR:-data/train/${TASK}/${SFT_MODEL_NAME}/q_correction_memory_without_perturb/${RUN_TAG}/}"
 MEMORY_DIR="${MEMORY_DIR:-${OUT_DIR}/memory}"
 MEMORY_LOG_FILE="${MEMORY_LOG_FILE:-${OUT_DIR}/${SLICE_ID}of${SLICE_NUM}_slices_bon_memory_correction_decisions.jsonl}"
@@ -133,6 +137,9 @@ if [[ "${ENABLE_MEMORY}" == "1" ]]; then
     --memory_dir "${MEMORY_DIR}"
     --memory_log_file "${MEMORY_LOG_FILE}"
     --memory_weight "${MEMORY_WEIGHT}"
+    --memory_correction_mode "${MEMORY_CORRECTION_MODE}"
+    --memory_correction_q_margin_threshold "${MEMORY_CORRECTION_Q_MARGIN_THRESHOLD}"
+    --memory_correction_min_episode_final_reward "${MEMORY_CORRECTION_MIN_EPISODE_FINAL_REWARD}"
     --memory_gamma "${MEMORY_GAMMA}"
     --memory_top_k "${MEMORY_TOP_K}"
     --memory_threshold "${MEMORY_THRESHOLD}"

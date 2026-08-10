@@ -463,6 +463,7 @@ class AlfWorldCorrectionMemory:
         previous_actions: Sequence[str],
         candidate_actions: Sequence[str],
         inventory: str = "",
+        min_episode_final_reward: Optional[float] = None,
     ) -> Dict[str, Any]:
         """Compute memory advantages for existing QLASS candidates.
 
@@ -497,6 +498,7 @@ class AlfWorldCorrectionMemory:
             observation=observation,
             previous_actions=previous_actions,
             inventory=inventory,
+            min_episode_final_reward=min_episode_final_reward,
         )
 
         neighbors = retrieval_result["neighbors"]

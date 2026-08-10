@@ -801,6 +801,18 @@ def main(args):
         if args.memory_weight < 0.0:
             raise ValueError("--memory_weight must be non-negative.")
 
+        if args.memory_correction_q_margin_threshold < 0.0:
+            raise ValueError(
+                "--memory_correction_q_margin_threshold must be non-negative."
+            )
+
+        if not (
+            0.0 <= args.memory_correction_min_episode_final_reward <= 1.0
+        ):
+            raise ValueError(
+                "--memory_correction_min_episode_final_reward must be in the range [0, 1]."
+            )
+
         if not (0.0 <= args.memory_augmentation_min_episode_final_reward <= 1.0):
             raise ValueError(
                 "--memory_augmentation_min_episode_final_reward "
@@ -850,6 +862,9 @@ def main(args):
                 "agent_model_name": args.model_name,
                 "memory_dir": memory_dir,
                 "memory_weight": args.memory_weight,
+                "memory_correction_mode": args.memory_correction_mode,
+                "memory_correction_q_margin_threshold": args.memory_correction_q_margin_threshold,
+                "memory_correction_min_episode_final_reward": args.memory_correction_min_episode_final_reward,
                 "memory_gamma": args.memory_gamma,
                 "memory_top_k": args.memory_top_k,
                 "memory_threshold": args.memory_threshold,
@@ -1283,6 +1298,51 @@ def main(args):
                     # without support and never introduces new actions.
                     memory_result: Optional[Dict[str, Any]] = None
                     if correction_memory is not None:
+                        # --------------------------------------------------------------
+                        # QNet uncertainty over UNIQUE actions.
+                        #
+                        # Different raw candidates may contain the same exact command with different Thoughts / Q scores.
+                        # Such duplicates must not create artificial QNet uncertainty.
+                        #
+                        # We use only QNet-scored candidates here. Terminal environment rewards are not QNet confidence estimates.
+                        # --------------------------------------------------------------
+                        unique_action_best_q: Dict[str, float] = {}
+
+                        for record in candidate_records:
+                            if record.get("score_source") != "qnet":
+                                continue
+
+                            action_key = correction_memory.normalize_action(
+                                record["action_command"]
+                            )
+
+                            if not action_key or action_key == INVALID_ACTION_COMMAND:
+                                continue
+
+                            q_score = float(record["base_score"])
+
+                            previous_best = unique_action_best_q.get(action_key)
+
+                            if previous_best is None or q_score > previous_best:
+                                unique_action_best_q[action_key] = q_score
+
+
+                        unique_q_scores = sorted(unique_action_best_q.values(), reverse=True)
+
+                        if len(unique_q_scores) >= 2:
+                            unique_q_margin = unique_q_scores[0] - unique_q_scores[1]
+                        else:
+                            unique_q_margin = None
+
+                        if args.memory_correction_mode == "mean_return_uncertainty_gated":
+                            memory_correction_gate_applied = bool(
+                                unique_q_margin is not None
+                                and unique_q_margin <= args.memory_correction_q_margin_threshold + 1e-12
+                            )
+                        else:
+                            # Preserve the old normalized-advantage behavior.
+                            memory_correction_gate_applied = True
+
                         memory_result = correction_memory.score_candidates(
                             task_text=task_text,
                             observation=observation_before_action,
@@ -1292,17 +1352,34 @@ def main(args):
                                 for record in candidate_records
                             ],
                             inventory=inventory_before_action,
+                            min_episode_final_reward=args.memory_correction_min_episode_final_reward,
                         )
                         memory_scores = memory_result["candidate_scores"]
                         assert len(memory_scores) == len(candidate_records)
 
-                        for record, memory_score in zip(
-                            candidate_records, memory_scores
-                        ):
-                            normalized_advantage = float(
-                                memory_score["normalized_advantage"]
-                            )
-                            correction = args.memory_weight * normalized_advantage
+                        for record, memory_score in zip(candidate_records, memory_scores):
+                            normalized_advantage = float(memory_score["normalized_advantage"])
+                            mean_return = float(memory_score["mean_return"])
+
+                            if args.memory_correction_mode == "normalized_advantage":
+                                memory_correction_signal = normalized_advantage
+
+                                correction = args.memory_weight * memory_correction_signal
+                            elif args.memory_correction_mode == "mean_return_uncertainty_gated":
+                                memory_correction_signal = mean_return
+
+                                # Apply correction only to actual QNet scores, and only when QNet is uncertain between
+                                # at least two UNIQUE actions.
+                                if memory_correction_gate_applied and record.get("score_source") == "qnet":
+                                    correction = args.memory_weight * memory_correction_signal
+                                else:
+                                    correction = 0.0
+                            else:
+                                raise ValueError(
+                                    "Unsupported memory_correction_mode: "
+                                    f"{args.memory_correction_mode!r}"
+                                )
+
                             record.update(
                                 {
                                     "memory_has_support": bool(
@@ -1311,6 +1388,8 @@ def main(args):
                                     "memory_match_count": int(
                                         memory_score["match_count"]
                                     ),
+                                    "memory_correction_signal": memory_correction_signal,
+                                    "memory_correction_mode": args.memory_correction_mode,
                                     "memory_mean_return": float(
                                         memory_score["mean_return"]
                                     ),
@@ -1516,6 +1595,19 @@ def main(args):
                                     "effective_similarity_threshold"
                                 ],
                                 "baseline_return": memory_result["baseline_return"],
+                                "memory_correction_mode": args.memory_correction_mode,
+                                "memory_correction_q_margin_threshold": args.memory_correction_q_margin_threshold,
+                                "memory_correction_unique_action_count": len(unique_action_best_q),
+                                "memory_correction_unique_q_margin": unique_q_margin,
+                                "memory_correction_gate_applied": memory_correction_gate_applied,
+                                "memory_correction_min_episode_final_reward": args.memory_correction_min_episode_final_reward,
+                                "memory_correction_steps_before_quality_gate": memory_result["num_valid_memory_steps"],
+                                "memory_correction_steps_after_quality_gate": (
+                                    memory_result["num_quality_eligible_memory_steps"]
+                                ),
+                                "memory_correction_steps_filtered_by_quality_gate": (
+                                    memory_result["num_filtered_by_quality_gate"]
+                                ),
                                 "best_matches": memory_result["best_matches"],
                                 "base_best_candidate_id": base_best_idx,
                                 "corrected_best_candidate_id": corrected_best_idx,
@@ -2037,8 +2129,38 @@ if __name__ == "__main__":
         "--memory_weight",
         type=float,
         default=0.0,
-        help="Lambda in corrected_score = qnet_score + lambda * normalized_advantage.",
+        help="Lambda multiplying the memory correction signal. The signal is selected by --memory_correction_mode.",
     )
+
+    parser.add_argument(
+        "--memory_correction_mode",
+        type=str,
+        choices=["normalized_advantage", "mean_return_uncertainty_gated"],
+        default="normalized_advantage",
+        help=(
+            "Memory signal used to correct candidate scores. "
+            "normalized_advantage preserves the original behavior; "
+            "mean_return_uncertainty_gated adds lambda * mean_return "
+            "only when the QNet margin between the top two unique QNet-scored actions is small enough."
+        ),
+    )
+    parser.add_argument(
+        "--memory_correction_q_margin_threshold",
+        type=float,
+        default=0.02,
+        help=(
+            "Apply mean-return memory correction only when the top-1 minus top-2 QNet margin over unique actions <= this threshold."
+        ),
+    )
+    parser.add_argument(
+        "--memory_correction_min_episode_final_reward",
+        type=float,
+        default=0.0,
+        help=(
+            "Use an episode for score correction only when its final reward is at least this value. Filtering is performed before retrieval top-k truncation."
+        ),
+    )
+
     parser.add_argument(
         "--memory_gamma",
         type=float,
