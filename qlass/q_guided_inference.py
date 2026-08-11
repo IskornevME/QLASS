@@ -742,6 +742,19 @@ def main(args):
     if args.max_steps is not None and args.max_steps <= 0:
         raise ValueError("--max_steps must be a positive integer.")
 
+    if args.alfworld_react_prompt:
+        if args.exp_config != "alfworld":
+            raise ValueError("--alfworld_react_prompt is supported only for ALFWorld.")
+
+        if args.best_of_N != 1:
+            raise ValueError("--alfworld_react_prompt baseline requires --best_of_N=1.")
+
+        if args.critic_backend != "none":
+            raise ValueError("--alfworld_react_prompt baseline requires --critic_backend=none.")
+
+        if args.enable_memory_correction:
+            raise ValueError("--alfworld_react_prompt baseline should be run without memory.")
+
     if args.enable_memory_action_augmentation and not args.enable_memory_correction:
         raise ValueError(
             "--enable_memory_action_augmentation requires --enable_memory_correction."
@@ -895,6 +908,8 @@ def main(args):
             ),
         }
     )
+    if args.alfworld_react_prompt:
+        agent_config["config"]["response_format_reminder"] = ""
 
     env_config = exp_config["env_config"]
     if args.max_steps is not None:
@@ -1233,8 +1248,11 @@ def main(args):
                             f"replay_actions={replay_actions}\n"
                             f"traj_actions={traj_actions}\n"
                         )
-
-                        if (not idx) or args.disable_perturb:
+                        if args.alfworld_react_prompt:
+                            cur_state_history = env.build_react_actor_messages(
+                                history_length=args.alfworld_history_length,
+                            )
+                        elif (not idx) or args.disable_perturb:
                             cur_state_history = cur_traj_state.history
                         else:
                             assert not args.disable_perturb
@@ -2347,6 +2365,21 @@ if __name__ == "__main__":
         "--policy_presence_penalty",
         type=float,
         default=None,
+    )
+
+    parser.add_argument(
+        "--alfworld_react_prompt",
+        action="store_true",
+        help=(
+            "Use AdaMEM-style ALFWorld ReAct actor prompt with compact observation/action history and admissible actions."
+        ),
+    )
+
+    parser.add_argument(
+        "--alfworld_history_length",
+        type=int,
+        default=50,
+        help="Number of previous ALFWorld observation/action steps in ReAct prompt.",
     )
 
     parser.add_argument(

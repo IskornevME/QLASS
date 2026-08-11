@@ -15,6 +15,28 @@ from alfworld.agents.environment.alfred_tw_env import AlfredDemangler, AlfredInf
 logger = logging.getLogger("agent_frame")
 
 
+ALFWORLD_REACT_TEMPLATE_NO_HIS = """
+You are an expert agent operating in the ALFRED Embodied Environment.
+Your current observation is: {current_observation}
+Your admissible actions of the current situation are: [{admissible_actions}].
+
+Now it's your turn to take an action.
+You should first reason step-by-step about the current situation. This reasoning process MUST be enclosed within <think> </think> tags.
+Once you've finished your reasoning, you should choose an admissible action for current step and present it within <action> </action> tags.
+"""
+
+ALFWORLD_REACT_TEMPLATE = """
+You are an expert agent operating in the ALFRED Embodied Environment. Your task is to: {task_description}
+Prior to this step, you have already taken {step_count} step(s). Below are the most recent {history_length} observations and the corresponding actions you took: {action_history}
+You are now at step {current_step} and your current observation is: {current_observation}
+Your admissible actions of the current situation are: [{admissible_actions}].
+
+Now it's your turn to take an action.
+You should first reason step-by-step about the current situation. This reasoning process MUST be enclosed within <think> </think> tags.
+Once you've finished your reasoning, you should choose an admissible action for current step and present it within <action> </action> tags.
+"""
+
+
 def process_ob(ob):
     if ob.startswith('You arrive at loc '):
         ob = ob[ob.find('. ')+2:]
@@ -33,6 +55,8 @@ class AlfWorldEnv(BaseEnv):
         self.env = self._load_single_task_env(self.task.game_file)
         self.state = State()
         self.current_admissible_commands = []
+        self.react_history = []
+        self.react_current_observation = None
     
     def _load_single_task_env(self, gamefile: str):
         alfworld_data_path = "eval_agent/data/alfworld"
@@ -72,12 +96,77 @@ class AlfWorldEnv(BaseEnv):
         """Return admissible ALFWorld commands for the current environment state."""
         return list(getattr(self, "current_admissible_commands", []) or [])
 
+
+    def build_react_actor_messages(self, history_length: int = 50):
+        history_length = max(int(history_length), 0)
+
+        admissible = [
+            action for action in self.get_admissible_commands() if action != "help"
+        ]
+        admissible_text = "\n ".join(
+            f"'{action}'" for action in admissible
+        )
+
+        if not self.react_history:
+            prompt = ALFWORLD_REACT_TEMPLATE_NO_HIS.format(
+                current_observation=self.react_current_observation,
+                admissible_actions=admissible_text,
+            )
+            return [{"role": "user", "content": prompt.strip()}]
+
+        marker = "Your task is to:"
+        initial_observation = self.task.observation
+
+        if marker in initial_observation:
+            task_description = initial_observation.split(
+                marker, 1
+            )[1].strip()
+        else:
+            task_description = initial_observation.strip()
+
+        recent_history = self.react_history[-history_length:] if history_length > 0 else []
+
+        first_step = len(self.react_history) - len(recent_history) + 1
+
+        history_lines = []
+        for offset, (observation, action) in enumerate(recent_history):
+            step_num = first_step + offset
+            history_lines.append(
+                f"[Observation {step_num}: '{observation}', Action {step_num}: '{action}']"
+            )
+
+        prompt = ALFWORLD_REACT_TEMPLATE.format(
+            task_description=task_description,
+            step_count=len(self.react_history),
+            history_length=len(recent_history),
+            action_history="\n".join(history_lines),
+            current_step=len(self.react_history) + 1,
+            current_observation=self.react_current_observation,
+            admissible_actions=admissible_text,
+        )
+
+        return [{"role": "user", "content": prompt.strip()}]
+
+
+
     def parse_action(self, llm_output: str) -> str:
         llm_output = llm_output.strip()
-        pattern = re.compile(r"Action:\s?(.*)", re.DOTALL)
-        action = re.findall(pattern, llm_output)[0]
-        assert action is not None
-        return action
+
+        # New ReAct/AdaMEM format.
+        match = re.search(
+            r"<action>\s*(.*?)\s*</action>",
+            llm_output,
+            flags=re.DOTALL | re.IGNORECASE,
+        )
+        if match:
+            return match.group(1).strip()
+
+        # Legacy QLASS format.
+        match = re.search(r"Action:\s?(.*)", llm_output, flags=re.DOTALL)
+        if match:
+            return match.group(1).strip()
+
+        raise ValueError("Could not parse action from LLM output")
 
     def conduct_action(self, action: str):
         observation, reward, done, info = self.env.step([action])
@@ -95,15 +184,25 @@ class AlfWorldEnv(BaseEnv):
             "role": "assistant",
             "content": llm_output
         })
+        react_observation_before = self.react_current_observation
         try:
             action = self.parse_action(llm_output)
             observation, reward, done = self.conduct_action(action)
+
+            self.react_history.append(
+                (react_observation_before, action)
+            )
+            self.react_current_observation = observation
         except Exception as e:
             # logger.debug(f"Agent failed with error: {e}")
             self.state.success = False
             self.state.finished = False
             self.state.reward=0
             observation = f"Observation: Error Input. Your input must contains 'Action: '"
+            self.react_history.append(
+                (react_observation_before, "__invalid_action__")
+            )
+            self.react_current_observation = observation
             self.state.history.append({
                 "role": "user",
                 "content": observation,
@@ -124,24 +223,33 @@ class AlfWorldEnv(BaseEnv):
         })
 
         self.state.steps += 1
-        if self.state.steps >= self.max_steps:
+        if done:
+            self.state.finished = True
+            self.state.success = bool(reward)
+            self.state.reward = reward
+
+            if self.state.success:
+                self.state.terminate_reason = "success"
+            elif self.state.steps >= self.max_steps:
+                self.state.terminate_reason = "max_steps"
+            else:
+                self.state.terminate_reason = "env_done"
+
+        elif self.state.steps >= self.max_steps:
             self.state.finished = True
             self.state.success = False
             self.state.terminate_reason = "max_steps"
             self.state.reward = reward
-
-        if done:
-            self.state.finished = True
-            self.state.success = True
-            self.state.terminate_reason = "success"
-            self.state.reward = reward
-
         return observation, self.state
 
     def reset(self,num_icl_examples=1) -> Tuple[str, State]:
         self.state = State()
         self.state.error = self.task.game_file
         cur_task = self.task.observation
+
+        self.react_history = []
+        self.react_current_observation = cur_task
+
         #observation, messages = prompt_with_icl(self.instruction, self.raw_icl, cur_task, num_icl_examples)
         if num_icl_examples > 0:
             observation, messages = prompt_with_icl(self.instruction, self.raw_icl, cur_task, num_icl_examples)

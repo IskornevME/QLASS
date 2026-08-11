@@ -29,6 +29,31 @@ fi
 # shellcheck source=/dev/null
 source "${MODEL_PROFILE_PATH}"
 
+ALFWORLD_REACT_MODE="${ALFWORLD_REACT_MODE:-0}"
+
+if [[ "${ALFWORLD_REACT_MODE}" == "1" ]]; then
+  if [[ "${BENCHMARK}" != "alfworld" ]]; then
+    echo "[ERROR] ALFWORLD_REACT_MODE is supported only for ALFWorld." >&2
+    exit 1
+  fi
+
+  # Pure Qwen actor baseline.
+  CRITIC_BACKEND="none"
+  BON="1"
+
+  # Match AdaMEM ALFWorld setup.
+  ICL="0"
+  MAX_STEPS="50"
+  POLICY_MAX_NEW_TOKENS="2048"
+
+  # AdaMEM uses temperature=0.7.
+  POLICY_TEMPERATURE="0.7"
+
+  # No memory in the baseline.
+  ENABLE_MEMORY="0"
+  ENABLE_MEMORY_ACTION_AUGMENTATION="0"
+fi
+
 if [[ ! -d "${POLICY_MODEL_PATH}" ]]; then
   echo "[ERROR] Qwen checkpoint directory not found: ${POLICY_MODEL_PATH}" >&2
   exit 1
@@ -198,7 +223,13 @@ else
   MEMORY_TAG="no_memory"
 fi
 
-RUN_TAG="${DATA_PREFIX}_${CRITIC_BACKEND}_bon${BON}_traj${N_TRAJS}_steps${MAX_STEPS}_${SPLIT}_run${RUN_ID}_${MEMORY_TAG}_${TERMINAL_TAG}_${AUG_TAG}"
+if [[ "${ALFWORLD_REACT_MODE}" == "1" ]]; then
+  PROMPT_TAG="react50"
+else
+  PROMPT_TAG="legacy_prompt"
+fi
+
+RUN_TAG="${DATA_PREFIX}_${CRITIC_BACKEND}_bon${BON}_traj${N_TRAJS}_steps${MAX_STEPS}_${PROMPT_TAG}_${SPLIT}_run${RUN_ID}_${MEMORY_TAG}_${TERMINAL_TAG}_${AUG_TAG}"
 
 if [[ "${CRITIC_BACKEND}" == "qnet" ]]; then
   RUN_FAMILY="qwen_llama_qnet"
@@ -329,6 +360,9 @@ echo "[CONFIG] Memory weight:    ${MEMORY_WEIGHT}"
 echo "[CONFIG] Augmentation:     ${ENABLE_MEMORY_ACTION_AUGMENTATION}"
 echo "[CONFIG] Memory dir:       ${MEMORY_DIR}"
 echo "[CONFIG] Max tasks:        ${MAX_TASKS:-all}"
+echo "[CONFIG] ALFWorld ReAct mode: ${ALFWORLD_REACT_MODE}"
+echo "[CONFIG] ICL examples:         ${ICL}"
+echo "[CONFIG] Policy max tokens:    ${POLICY_MAX_NEW_TOKENS}"
 
 # -----------------------------------------------------------------------------
 # Start the SGLang server and guarantee cleanup on exit.
@@ -389,6 +423,15 @@ if [[ "${SERVER_READY}" != "1" ]]; then
   exit 1
 fi
 
+REACT_ARGS=()
+
+if [[ "${ALFWORLD_REACT_MODE}" == "1" ]]; then
+  REACT_ARGS+=(
+    --alfworld_react_prompt
+    --alfworld_history_length 50
+  )
+fi
+
 # -----------------------------------------------------------------------------
 # Build and run q_guided_inference.py.
 # Arrays avoid fragile backslash continuations and preserve empty groups.
@@ -413,6 +456,7 @@ INFERENCE_ARGS=(
   --exp_name "${EXP_NAME}"
   --exp_path qlass/configs/task/
   --benchmark "${BENCHMARK}"
+  "${REACT_ARGS[@]}"
   --max_steps "${MAX_STEPS}"
   --split "${SPLIT}"
   --slice_num "${SLICE_NUM}"
