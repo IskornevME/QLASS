@@ -90,6 +90,26 @@ def post_process_tree(root_node):
     del_repeated_child(root_node)
     return root_node
 
+
+def get_node_critic_conversation(node):
+    critic_state = getattr(
+        node,
+        "critic_state",
+        None,
+    )
+    critic_action = getattr(
+        node,
+        "critic_action",
+        None,
+    )
+
+    if critic_state is not None and critic_action is not None:
+        return critic_state + [critic_action]
+
+    # Backward compatibility with old trees.
+    return node.state + [node.action]
+
+
 def collect_q_data_from_a_tree(node):
     data = []
     def recurse(node):
@@ -98,7 +118,7 @@ def collect_q_data_from_a_tree(node):
             if not "Root" in node.action:
                 #print("node.action",node.action)
                 assert isinstance(node.action, dict) and node.action['from']=='gpt'
-                traj = node.state + [node.action]
+                traj = get_node_critic_conversation(node)
    
             entry = {
                 'conversations': traj,
@@ -122,7 +142,7 @@ def collect_r_data_from_a_tree(node):
             if not "Root" in node.action:
                 #print("node.action",node.action)
                 assert isinstance(node.action, dict) and node.action['from']=='gpt'
-                traj = node.state + [node.action]
+                traj = get_node_critic_conversation(node)
             entry = {
                 'conversations': traj,
                 'label': node.reward,

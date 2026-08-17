@@ -1,4 +1,5 @@
 import json
+import re
 import os
 import argparse
 from tqdm import tqdm
@@ -25,13 +26,18 @@ logger = logging.getLogger("agent_frame")
 
 class TreeNode:
     _id_counter = 0
-    def __init__(self, state, action,reward=0, q_value=0):
+    def __init__(self, state, action,reward=0, q_value=0, critic_state=None, critic_action=None,):
         self.id = TreeNode._get_next_id() 
         self.state = state # list of messages
         self.action = action # action of the current node
         self.reward = reward
         self.q_value = q_value
         self.children = []
+
+        # Exact state/action representation used to train the critic.
+        # None for legacy exploration.
+        self.critic_state = critic_state
+        self.critic_action = critic_action
         
     @classmethod
     def _get_next_id(cls):
@@ -104,6 +110,59 @@ class TreeNode:
         return len(self.children)
 
 
+def _messages_to_fastchat(messages):
+    role_map = {
+        "user": "human",
+        "assistant": "gpt",
+    }
+
+    conversations = []
+    for message in messages:
+        role = message["role"]
+        if role not in role_map:
+            raise ValueError(
+                f"Unsupported role for Q data: {role!r}"
+            )
+
+        conversations.append(
+            {
+                "from": role_map[role],
+                "value": str(message["content"]).strip(),
+            }
+        )
+
+    return conversations
+
+
+def _convert_expert_action_to_react(env, raw_action):
+    raw_action = str(raw_action).strip()
+
+    # Already in the new format.
+    if re.search(
+        r"<action>\s*.*?\s*</action>",
+        raw_action,
+        flags=re.DOTALL | re.IGNORECASE,
+    ):
+        return raw_action
+
+    action = env.parse_action(raw_action)
+
+    thought_match = re.search(
+        r"Thought:\s*(.*?)\s*Action:",
+        raw_action,
+        flags=re.DOTALL | re.IGNORECASE,
+    )
+
+    if thought_match:
+        thought = thought_match.group(1).strip()
+        return (
+            f"<think>{thought}</think>\n"
+            f"<action>{action}</action>"
+        )
+
+    return f"<action>{action}</action>"
+
+
 def collect_and_print_stats(node):
     """ Recursively collect stats from the tree and print them. """
     def recurse_collect(node):
@@ -142,6 +201,16 @@ def collect_and_print_stats(node):
 
 MAX_TURNS={"webshop":5,"sciworld":18,"alfworld":18}
 
+
+def _build_actor_messages(env, state, args):
+    if args.alfworld_react_prompt:
+        return env.build_react_actor_messages(
+            history_length=args.alfworld_history_length
+        )
+
+    return copy.deepcopy(state.history)
+
+
 def main(args):
 
     with open(os.path.join(args.exp_path, f"{args.exp_config}.json")) as f:
@@ -152,7 +221,34 @@ def main(args):
     if args.model_name is not None:
         agent_config['config']['model_name'] = args.model_name
         agent_config['config']['batch_size'] = args.eval_batch_size
-        
+
+    policy_overrides = {
+        "server_address": args.policy_server_address,
+        "model_name": args.model_name,
+        "tokenizer_path": args.tokenizer_path,
+        "max_prompt_tokens": args.policy_max_prompt_tokens,
+        "max_new_tokens": args.policy_max_new_tokens,
+        "temperature": args.policy_temperature,
+        "top_p": args.policy_top_p,
+        "top_k": args.policy_top_k,
+        "min_p": args.policy_min_p,
+        "presence_penalty": args.policy_presence_penalty,
+    }
+
+    for key, value in policy_overrides.items():
+        if value is not None:
+            agent_config["config"][key] = value
+
+    if args.alfworld_react_prompt:
+        agent_config["config"]["response_format_reminder"] = ""
+
+        extra_request_body = dict(
+            agent_config["config"].get("extra_request_body", {}) or {}
+        )
+        extra_request_body["min_tokens"] = 128
+
+        agent_config["config"]["extra_request_body"] = extra_request_body
+
     env_config = exp_config["env_config"]
     logger.info(f"Experiment config: \n{json.dumps(exp_config, indent=2)}")
     
@@ -177,8 +273,8 @@ def main(args):
 
     if not os.path.exists(args.output_dir):
         os.makedirs(args.output_dir, exist_ok=True)
-    tree_file = args.output_dir + f'{args.slice_id}of${args.slice_num}_0shot_tree.pkl'
-    traj_file = args.output_dir + f'{args.slice_id}of${args.slice_num}_0shot_traj.jsonl'
+    tree_file = args.output_dir + f'{args.slice_id}of{args.slice_num}_0shot_tree.pkl'
+    traj_file = args.output_dir + f'{args.slice_id}of{args.slice_num}_0shot_traj.jsonl'
     
     done_task_id = []
     loaded_sft_trajs = json.load(open(f'{root_dir}/data/train/{args.exp_config}/{args.exp_config}_sft.json'))
@@ -234,7 +330,11 @@ def main(args):
             # Load the environment
             env: envs.BaseEnv = getattr(envs, env_config["env_class"])(task, **env_config)
             # env.icl_format = 'first' # first for treating the icl_example as prompt instead of several turns of conversations
-            env.max_steps = MAX_TURNS[args.exp_config]
+            env.max_steps = (
+                args.max_steps
+                if args.max_steps is not None
+                else MAX_TURNS[args.exp_config]
+            )
             if env.icl_format == 'first':
                 start_i = 1
             elif env.icl_format == 'conversation':
@@ -259,10 +359,29 @@ def main(args):
             cur_step = 1
             
             expert_action_list = [conv['value'] for conv in expert_traj if conv['from'] == 'gpt']
-            
+            expert_critic_inputs = []
+            expert_executed_actions = []
             while not sft_state.finished:
                 expert_action = expert_action_list[cur_step]
+                if args.alfworld_react_prompt:
+                    expert_action = _convert_expert_action_to_react(
+                        env,
+                        expert_action,
+                    )
+
                 cur_step += 1
+
+                if args.alfworld_react_prompt:
+                    expert_critic_inputs.append(
+                        env.build_react_actor_messages(
+                            history_length=args.alfworld_history_length
+                        )
+                    )
+
+                expert_executed_actions.append(expert_action)
+
+                observation, sft_state = env.step(expert_action)
+
                 observation, sft_state = env.step(expert_action)
                 if expert_action == "OK":
                     print("OK happened during expert action")
@@ -328,10 +447,14 @@ def main(args):
                     if reached_terminal:
                         continue
 
-                    # Get the input for the agent
-                    if len(new_action_list)==0:
-                        input = state.history
-                    else:
+                    base_input = _build_actor_messages(
+                        env=env,
+                        state=state,
+                        args=args,
+                    )
+
+                    input = copy.deepcopy(base_input)
+                    if len(new_action_list) > 0:
                         # Make sure the agent does not repeat the already explored action
                         if len(new_action_list) == 1:
                             explore_add_prompt = f"\nPlease provide another reasonable response different from '{new_action_list[0]}'."
@@ -345,9 +468,8 @@ def main(args):
                             if args.exp_config=='webshop':
                                 explore_add_prompt += "If the previous actions were 'search', your new action should be searching for different content. If previous actions were 'click', your new action should be clicking on a different item."
 
-                        input = copy.deepcopy(state.history)
-                        input[-1]['content'] += explore_add_prompt
-                        
+                        input[-1]["content"] += explore_add_prompt
+
                     action = agent(input)
 
                     new_action_list.append(action)
@@ -366,7 +488,24 @@ def main(args):
                         for j, msg in enumerate(new_state.history):
                             print(j, msg)
                         raise
-                    new_node = TreeNode(state=cur_state[:-2],action=cur_state[-2],reward=new_state.reward)
+
+                    critic_state = None
+                    critic_action = None
+
+                    if args.alfworld_react_prompt:
+                        critic_state = _messages_to_fastchat(base_input)
+                        critic_action = {
+                            "from": "gpt",
+                            "value": action.strip(),
+                        }
+
+                    new_node = TreeNode(
+                        state=cur_state[:-2],
+                        action=cur_state[-2],
+                        reward=new_state.reward,
+                        critic_state=critic_state,
+                        critic_action=critic_action,
+                    )
                     assert isinstance(cur_state[-2],dict) and cur_state[-2]['from']=='gpt'
                     node.add_child(new_node)
 
@@ -379,10 +518,21 @@ def main(args):
                         current_depth = new_depth + 1
                         initial_new_node = new_node
                         while not new_state.finished:
-                            action = agent(new_state.history)
+                            base_input = _build_actor_messages(
+                                env=env,
+                                state=new_state,
+                                args=args,
+                            )
+                            action = agent(base_input)
                             _, new_state = env.step(action)
                             # current_depth +=1
-                            new_node = TreeNode(state=new_state.to_dict()['conversations'][:-2], action=new_state.to_dict()['conversations'][-2], reward=new_state.reward)
+                            new_node = TreeNode(
+                                state=new_state.to_dict()['conversations'][:-2],
+                                action=new_state.to_dict()['conversations'][-2],
+                                reward=new_state.reward,
+                                critic_state=_messages_to_fastchat(base_input) if args.alfworld_react_prompt else None,
+                                critic_action={"from": "gpt", "value": action.strip()} if args.alfworld_react_prompt else None,
+                            )
                             assert isinstance(new_state.to_dict()['conversations'][-2],dict) and new_state.to_dict()['conversations'][-2]['from']=='gpt'
                             current_node.add_child(new_node)
                             current_node = new_node
@@ -428,18 +578,38 @@ def main(args):
                 # assert isinstance(new_state[-1],dict) and new_state[-1]['from']=='gpt'
                 conv = sft_state.to_dict()['conversations'][:i*2]
 
+                expert_idx = i - start_i
+
                 if len(conv) >= 2 and conv[-1]['from'] == 'human' and conv[-2]['from'] == 'gpt':
-                    new_node = TreeNode(state=conv[:-2], action=conv[-2], reward=sft_state.reward)
+                    new_node = TreeNode(
+                        state=conv[:-2],
+                        action=conv[-2],
+                        reward=sft_state.reward,
+                        critic_state=_messages_to_fastchat(expert_critic_inputs[expert_idx]) if args.alfworld_react_prompt else None,
+                        critic_action={"from": "gpt", "value": expert_executed_actions[expert_idx]} if args.alfworld_react_prompt else None,
+                    )
                 elif len(conv) >= 1 and conv[-1]['from'] == 'gpt':
-                    new_node = TreeNode(state=conv[:-1], action=conv[-1], reward=sft_state.reward)
+                    new_node = TreeNode(
+                        state=conv[:-1],
+                        action=conv[-1],
+                        reward=sft_state.reward,
+                        critic_state=_messages_to_fastchat(expert_critic_inputs[expert_idx]) if args.alfworld_react_prompt else None,
+                        critic_action={"from": "gpt", "value": expert_executed_actions[expert_idx]} if args.alfworld_react_prompt else None,
+                    )
                 else:
                     raise ValueError(f"Unexpected conversation suffix: {conv[-4:]}")
 
                 if i > start_i and i <= args.max_depth:
                     _, bro_state = env.reset(args.num_icl_examples)
 
-                    prefix_actions = [m['value'] for m in conv if m['from'] == 'gpt']
-                    for action in prefix_actions[:-1]:
+                    if args.alfworld_react_prompt:
+                        prefix_actions = expert_executed_actions[:expert_idx]
+                    else:
+                        prefix_actions = [
+                            m["value"] for m in conv if m["from"] == "gpt"
+                        ][:-1]
+
+                    for action in prefix_actions:
                         _, bro_state = env.step(action)
                         if bro_state.finished:
                             break
@@ -447,16 +617,39 @@ def main(args):
                     if bro_state.finished:
                         continue
 
-                    brother_action = agent(bro_state.history)
+                    base_input = _build_actor_messages(
+                        env=env,
+                        state=bro_state,
+                        args=args,
+                    )
+                    brother_action = agent(base_input)
+
                     _, bro_state = env.step(brother_action)
-                    brother_root_node = TreeNode(state=bro_state.to_dict()['conversations'][:-2], action=bro_state.to_dict()['conversations'][-2],reward=bro_state.reward)
+                    brother_root_node = TreeNode(
+                        state=bro_state.to_dict()['conversations'][:-2],
+                        action=bro_state.to_dict()['conversations'][-2],
+                        reward=bro_state.reward,
+                        critic_state=_messages_to_fastchat(base_input) if args.alfworld_react_prompt else None,
+                        critic_action={"from": "gpt", "value": action.strip()} if args.alfworld_react_prompt else None,
+                    )
                     assert isinstance(bro_state.to_dict()['conversations'][-2],dict)and bro_state.to_dict()['conversations'][-2]['from']=='gpt' 
                     brother_current_node = brother_root_node
 
                     while not bro_state.finished:
-                        brother_action = agent(bro_state.history)
+                        base_input = _build_actor_messages(
+                            env=env,
+                            state=bro_state,
+                            args=args,
+                        )
+                        brother_action = agent(base_input)
                         _,bro_state = env.step(brother_action)
-                        brother_new_node = TreeNode(state=bro_state.to_dict()['conversations'][:-2], action=bro_state.to_dict()['conversations'][-2], reward=bro_state.reward)
+                        brother_new_node = TreeNode(
+                            state=bro_state.to_dict()['conversations'][:-2],
+                            action=bro_state.to_dict()['conversations'][-2],
+                            reward=bro_state.reward,
+                            critic_state=_messages_to_fastchat(base_input) if args.alfworld_react_prompt else None,
+                            critic_action={"from": "gpt", "value": action.strip()} if args.alfworld_react_prompt else None,
+                        )
                         assert isinstance(bro_state.to_dict()['conversations'][-2], dict) and bro_state.to_dict()['conversations'][-2]['from']=='gpt' 
                         brother_current_node.add_child(brother_new_node)
                         brother_current_node = brother_new_node
@@ -628,6 +821,77 @@ if __name__ == "__main__":
         default="data/train/explore/",
         help='The path to save the generated trajectories and trees.'
     )
+
+    parser.add_argument(
+        "--max_steps",
+        type=int,
+        default=None,
+    )
+
+    parser.add_argument(
+        "--policy_server_address",
+        type=str,
+        default=None,
+    )
+    parser.add_argument("--tokenizer_path", type=str, default=None,
+        help="Tokenizer path used by the policy actor. For SGLangChatAgent with Qwen this must point to the Qwen checkpoint.",
+    )
+    parser.add_argument(
+        "--policy_max_prompt_tokens",
+        type=int,
+        default=3800,
+    )
+    parser.add_argument(
+        "--policy_max_new_tokens",
+        type=int,
+        default=None,
+    )
+    parser.add_argument(
+        "--policy_temperature",
+        type=float,
+        default=None,
+    )
+
+    parser.add_argument(
+        "--policy_top_p",
+        type=float,
+        default=None,
+    )
+
+    parser.add_argument(
+        "--policy_top_k",
+        type=int,
+        default=None,
+    )
+
+    parser.add_argument(
+        "--policy_min_p",
+        type=float,
+        default=None,
+    )
+
+    parser.add_argument(
+        "--policy_presence_penalty",
+        type=float,
+        default=None,
+    )
+
+    parser.add_argument(
+        "--alfworld_react_prompt",
+        action="store_true",
+        help=(
+            "Use AdaMEM-style ALFWorld ReAct actor prompt with compact observation/action history and admissible actions."
+        ),
+    )
+
+    parser.add_argument(
+        "--alfworld_history_length",
+        type=int,
+        default=50,
+        help="Number of previous ALFWorld observation/action steps in ReAct prompt.",
+    )
+
+
         
     args = parser.parse_args()
     if args.verbose:
