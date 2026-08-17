@@ -911,6 +911,12 @@ def main(args):
     if args.alfworld_react_prompt:
         agent_config["config"]["response_format_reminder"] = ""
 
+        extra_request_body = dict(
+            agent_config["config"].get("extra_request_body", {}) or {}
+        )
+        extra_request_body["min_tokens"] = 128
+        agent_config["config"]["extra_request_body"] = extra_request_body
+
     env_config = exp_config["env_config"]
     if args.max_steps is not None:
         env_config["max_steps"] = int(args.max_steps)

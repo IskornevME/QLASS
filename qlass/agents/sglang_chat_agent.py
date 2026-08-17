@@ -562,6 +562,9 @@ class SGLangChatAgent(LMAgent):
             )[:200]
             raise ValueError(
                 "SGLang response message has content=None. "
+                f"finish_reason={choice.get('finish_reason')!r} "
+                f"matched_stop={choice.get('matched_stop')!r} "
+                f"usage={response_payload.get('usage')!r} "
                 f"reasoning_content_preview={reasoning_preview!r}"
             )
 
