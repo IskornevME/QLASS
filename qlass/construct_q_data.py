@@ -211,10 +211,7 @@ def collect_vanilla_q_data_from_trees_unpruned(tree_pth, save_q_pth, upper_num=3
                 update_vanilla_rewards(child)
         else:
             node.reward = node.reward
-    num_tree = len(trees[0])
-    for n, tree in tqdm(enumerate(trees[0])):
-        if n == num_tree-1:
-            break
+    for tree in tqdm(trees[0]):
         for t in tree:
             id = t['id']
             # post_processed_t = post_process_tree(t['tree'])

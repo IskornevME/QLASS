@@ -217,7 +217,24 @@ def main(args):
         exp_config: Dict[str, Any] = json.load(f)
     with open(os.path.join(args.agent_path, f"{args.agent_config}.json")) as f:
         agent_config: Dict[str, Any] = json.load(f)
-        
+
+    if args.max_steps is not None and args.max_steps <= 0:
+        raise ValueError("--max_steps must be positive.")
+
+    if args.max_tasks is not None and args.max_tasks <= 0:
+        raise ValueError("--max_tasks must be positive.")
+
+    if args.alfworld_react_prompt:
+        if args.exp_config != "alfworld":
+            raise ValueError(
+                "--alfworld_react_prompt is supported only for ALFWorld."
+            )
+
+        if args.num_icl_examples != 0:
+            raise ValueError(
+                "Qwen ALFWorld ReAct exploration requires --num_icl_examples=0."
+            )
+
     if args.model_name is not None:
         agent_config['config']['model_name'] = args.model_name
         agent_config['config']['batch_size'] = args.eval_batch_size
@@ -295,6 +312,7 @@ def main(args):
     total_examples = []
     total_trees = []
     total_reward_cnts = []
+    processed_tasks = 0
     with logging_redirect_tqdm():
         pbar = tqdm(total=n_tasks)
         cnt = 0
@@ -304,6 +322,11 @@ def main(args):
             print("enter iteration")
             if args.exp_config == 'alfworld' and task.game_file.split('/json_2.1.1/train/')[-1].split('/game.tw-pddl')[0] not in sft_traj_set:
                 continue
+
+            if args.max_tasks is not None and processed_tasks >= args.max_tasks:
+                break
+
+            processed_tasks += 1
 
             # Find the expert trajectory for the current task
             expert_traj = None
@@ -357,45 +380,53 @@ def main(args):
             init_msg = observation
             logger.info(f"\n{Fore.YELLOW}{init_msg}{Fore.RESET}")    
             cur_step = 1
-            
-            expert_action_list = [conv['value'] for conv in expert_traj if conv['from'] == 'gpt']
+
+            expert_action_list = [conv["value"] for conv in expert_traj if conv["from"] == "gpt"]
+
+            # Старые ALFWorld SFT trajectories обычно начинаются с технического assistant message "OK".
+            if (
+                expert_action_list
+                and expert_action_list[0].strip() == "OK"
+            ):
+                expert_actions = expert_action_list[1:]
+            else:
+                expert_actions = expert_action_list
+
+            if args.alfworld_react_prompt:
+                expert_actions = [_convert_expert_action_to_react(env, action) for action in expert_actions]
+
             expert_critic_inputs = []
             expert_executed_actions = []
-            while not sft_state.finished:
-                expert_action = expert_action_list[cur_step]
-                if args.alfworld_react_prompt:
-                    expert_action = _convert_expert_action_to_react(
-                        env,
-                        expert_action,
-                    )
 
-                cur_step += 1
+            for expert_action in expert_actions:
+                if sft_state.finished:
+                    break
 
+                # Save the exact PRE-ACTION ReAct state that the critic should later evaluate.
                 if args.alfworld_react_prompt:
                     expert_critic_inputs.append(
-                        env.build_react_actor_messages(
-                            history_length=args.alfworld_history_length
-                        )
+                        env.build_react_actor_messages(history_length=args.alfworld_history_length)
                     )
 
                 expert_executed_actions.append(expert_action)
 
                 observation, sft_state = env.step(expert_action)
 
-                observation, sft_state = env.step(expert_action)
-                if expert_action == "OK":
-                    print("OK happened during expert action")
+            # Expert input was exhausted before the environment
+            # reported a terminal state.
+            if not sft_state.finished:
+                sft_state.success = False
+                sft_state.finished = True
+                sft_state.terminate_reason = "exceeding maximum input length"
+                sft_state.reward = expert_reward
 
-                if sft_state.finished:
-                    break
-                if expert_action == expert_action_list[-1]:
-                    sft_state.success = False
-                    sft_state.finished = True
-                    sft_state.terminate_reason = "exceeding maximum input length"
-                    sft_state.reward = expert_reward
-                    logger.info(f"Task finished in {sft_state.steps} steps. Success: {sft_state.success}. Reward: {sft_state.reward}")
-                    break
-            
+                logger.info(
+                    "Task finished in %d steps. Success: %s. Reward: %s",
+                    sft_state.steps,
+                    sft_state.success,
+                    sft_state.reward,
+                )
+
             root = TreeNode(state=init_msg, action='No Action (Root)',reward=0)
             node_queue = queue.Queue()
             node_queue.put(root)
@@ -630,7 +661,7 @@ def main(args):
                         action=bro_state.to_dict()['conversations'][-2],
                         reward=bro_state.reward,
                         critic_state=_messages_to_fastchat(base_input) if args.alfworld_react_prompt else None,
-                        critic_action={"from": "gpt", "value": action.strip()} if args.alfworld_react_prompt else None,
+                        critic_action={"from": "gpt", "value": brother_action.strip()} if args.alfworld_react_prompt else None,
                     )
                     assert isinstance(bro_state.to_dict()['conversations'][-2],dict)and bro_state.to_dict()['conversations'][-2]['from']=='gpt' 
                     brother_current_node = brother_root_node
@@ -648,7 +679,7 @@ def main(args):
                             action=bro_state.to_dict()['conversations'][-2],
                             reward=bro_state.reward,
                             critic_state=_messages_to_fastchat(base_input) if args.alfworld_react_prompt else None,
-                            critic_action={"from": "gpt", "value": action.strip()} if args.alfworld_react_prompt else None,
+                            critic_action={"from": "gpt", "value": brother_action.strip()} if args.alfworld_react_prompt else None,
                         )
                         assert isinstance(bro_state.to_dict()['conversations'][-2], dict) and bro_state.to_dict()['conversations'][-2]['from']=='gpt' 
                         brother_current_node.add_child(brother_new_node)
@@ -826,6 +857,12 @@ if __name__ == "__main__":
         "--max_steps",
         type=int,
         default=None,
+    )
+    parser.add_argument(
+        "--max_tasks",
+        type=int,
+        default=None,
+        help="Maximum number of eligible tasks to process. Useful for smoke tests.",
     )
 
     parser.add_argument(
