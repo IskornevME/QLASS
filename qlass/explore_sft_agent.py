@@ -211,6 +211,32 @@ def _build_actor_messages(env, state, args):
     return copy.deepcopy(state.history)
 
 
+def _get_node_replay_actions(node):
+    """Return the exact sequence of actions leading to this tree node."""
+
+    actions = []
+
+    for message in node.state:
+        if (
+            isinstance(message, dict)
+            and message.get("from") == "gpt"
+        ):
+            value = str(message.get("value", "")).strip()
+
+            # Technical assistant message from
+            # prompt_without_icl().
+            if value and value != "OK":
+                actions.append(value)
+
+    if isinstance(node.action, dict):
+        current_action = str(node.action.get("value", "")).strip()
+
+        if current_action:
+            actions.append(current_action)
+
+    return actions
+
+
 def main(args):
 
     with open(os.path.join(args.exp_path, f"{args.exp_config}.json")) as f:
@@ -439,10 +465,7 @@ def main(args):
                 node = node_queue.get()
                 depth = depth_queue.get()
 
-                if depth > args.max_depth:
-                    explore_samples = 1
-                else:
-                    explore_samples = args.samples_per_depth
+                explore_samples = args.samples_per_depth
                 
                 new_action_list = [child.action for child in node.children]
 
@@ -463,12 +486,9 @@ def main(args):
                     reached_terminal = False
 
                     if depth > 1:
-                        for cur_step in range(start_i, depth + start_i - 1):
-                            if cur_step < depth - 1:
-                                action = node.state[cur_step*2 - 1]['value']
-                            else:
-                                action = node.action['value']
+                        replay_actions = _get_node_replay_actions(node)
 
+                        for action in replay_actions:
                             observation, state = env.step(action)
 
                             if state.finished:
@@ -542,8 +562,9 @@ def main(args):
 
                     if not new_state.finished :
                         new_depth = depth + 1
-                        node_queue.put(new_node)
-                        depth_queue.put(new_depth)
+                        if new_depth <= args.max_depth:
+                            node_queue.put(new_node)
+                            depth_queue.put(new_depth)
                         # Roll out the trajectory
                         current_node = new_node
                         current_depth = new_depth + 1

@@ -48,11 +48,13 @@ QLASS_PYTHON="${QLASS_PYTHON:-/home/m.iskornev/miniforge3/envs/my_env/bin/python
 NUM_WORKERS="${NUM_WORKERS:-8}"
 NUM_SERVERS="${NUM_SERVERS:-2}"
 
-MAX_STEPS="${MAX_STEPS:-50}"
-MAX_DEPTH="${MAX_DEPTH:-8}"
+MAX_STEPS="${MAX_STEPS:-30}"
+MAX_DEPTH="${MAX_DEPTH:-5}"
 MIN_PRUNE_DEPTH="${MIN_PRUNE_DEPTH:-3}"
 SAMPLES_PER_DEPTH="${SAMPLES_PER_DEPTH:-2}"
 HISTORY_LENGTH="${HISTORY_LENGTH:-50}"
+
+MAX_TASKS_PER_WORKER="${MAX_TASKS_PER_WORKER:-}"
 
 SMOKE_TEST="${SMOKE_TEST:-0}"
 SMOKE_TASKS="${SMOKE_TASKS:-2}"
@@ -123,7 +125,20 @@ if [[ "${SMOKE_TEST}" == "1" ]]; then
 
     DEFAULT_OUTPUT_DIR="data/train/${TASK}/explore_qwen3_react_smoke/"
 else
-    DEFAULT_OUTPUT_DIR="data/train/${TASK}/explore_qwen3_react_d8_s2_mpr3/"
+    if [[ -n "${MAX_TASKS_PER_WORKER}" ]]; then
+        if ! [[ "${MAX_TASKS_PER_WORKER}" =~ ^[1-9][0-9]*$ ]]; then
+            echo \
+                "[ERROR] MAX_TASKS_PER_WORKER must be a positive integer." \
+                >&2
+            exit 1
+        fi
+
+        MAX_TASK_ARGS=(
+            --max_tasks "${MAX_TASKS_PER_WORKER}"
+        )
+    fi
+
+    DEFAULT_OUTPUT_DIR="data/train/${TASK}/explore_qwen3_react_d${MAX_DEPTH}_s${SAMPLES_PER_DEPTH}_mpr${MIN_PRUNE_DEPTH}/"
 fi
 
 
