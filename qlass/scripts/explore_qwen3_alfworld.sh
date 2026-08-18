@@ -55,6 +55,7 @@ SAMPLES_PER_DEPTH="${SAMPLES_PER_DEPTH:-2}"
 HISTORY_LENGTH="${HISTORY_LENGTH:-50}"
 
 MAX_TASKS_PER_WORKER="${MAX_TASKS_PER_WORKER:-}"
+EXCLUDE_TREE_DIR="${EXCLUDE_TREE_DIR:-}"
 
 SMOKE_TEST="${SMOKE_TEST:-0}"
 SMOKE_TASKS="${SMOKE_TASKS:-2}"
@@ -261,6 +262,14 @@ for ((server_idx=0; server_idx<NUM_SERVERS; server_idx++)); do
     start_server "${server_idx}"
 done
 
+EXCLUDE_ARGS=()
+
+if [[ -n "${EXCLUDE_TREE_DIR}" ]]; then
+    EXCLUDE_ARGS=(
+        --exclude_tree_dir "${EXCLUDE_TREE_DIR}"
+    )
+fi
+
 
 # -----------------------------------------------------------------------------
 # Configuration summary
@@ -321,6 +330,7 @@ for ((i=0; i<NUM_WORKERS; i++)); do
         --num_icl_examples 0 \
         --output_dir "${OUTPUT_DIR}" \
         "${MAX_TASK_ARGS[@]}" \
+        "${EXCLUDE_ARGS[@]}" \
         > "${worker_log}" 2>&1 &
 
     WORKER_PIDS+=("$!")

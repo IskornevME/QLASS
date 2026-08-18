@@ -237,6 +237,35 @@ def _get_node_replay_actions(node):
     return actions
 
 
+def _load_excluded_task_ids(tree_dir):
+    if not tree_dir:
+        return set()
+
+    if not os.path.isdir(tree_dir):
+        raise ValueError(f"Exclude tree directory does not exist: {tree_dir}")
+
+    excluded_ids = set()
+
+    for filename in sorted(os.listdir(tree_dir)):
+        if not filename.endswith("_tree.pkl"):
+            continue
+
+        # Do not accidentally consume the output of construct_q_data.py.
+        if filename == "combined_tree.pkl":
+            continue
+
+        path = os.path.join(tree_dir,filename)
+
+        with open(path, "rb") as f:
+            trees = pickle.load(f)
+
+        for entry in trees:
+            if isinstance(entry, dict) and "id" in entry:
+                excluded_ids.add(str(entry["id"]))
+
+    return excluded_ids
+
+
 def main(args):
 
     with open(os.path.join(args.exp_path, f"{args.exp_config}.json")) as f:
@@ -333,6 +362,12 @@ def main(args):
         sft_traj_trail = [traj['game_file'].split('/json_2.1.1/train/')[-1] for traj in loaded_sft_trajs]
         sft_traj_set = set(sft_traj_trail)
 
+    excluded_task_ids = _load_excluded_task_ids(
+        args.exclude_tree_dir
+    )
+    if excluded_task_ids:
+        print(f"Loaded {len(excluded_task_ids)} task ids to exclude.")
+
     all_tasks, n_tasks = task_class.load_tasks(args.split, args.slice_num, args.slice_id)
 
     total_examples = []
@@ -340,7 +375,8 @@ def main(args):
     total_reward_cnts = []
     processed_tasks = 0
     with logging_redirect_tqdm():
-        pbar = tqdm(total=n_tasks)
+        pbar_total = args.max_tasks if args.max_tasks is not None else n_tasks
+        pbar = tqdm(total=pbar_total)
         cnt = 0
         for i, task in enumerate(all_tasks):
             if args.debug and i >= 2:
@@ -348,11 +384,6 @@ def main(args):
             print("enter iteration")
             if args.exp_config == 'alfworld' and task.game_file.split('/json_2.1.1/train/')[-1].split('/game.tw-pddl')[0] not in sft_traj_set:
                 continue
-
-            if args.max_tasks is not None and processed_tasks >= args.max_tasks:
-                break
-
-            processed_tasks += 1
 
             # Find the expert trajectory for the current task
             expert_traj = None
@@ -373,7 +404,15 @@ def main(args):
             else:
                 raise NotImplementedError(f"Unsupported task: {args.exp_config}")
             assert expert_traj != None
-            
+
+            if str(id) in excluded_task_ids:
+                continue
+
+            if args.max_tasks is not None and processed_tasks >= args.max_tasks:
+                break
+
+            processed_tasks += 1
+
             ds = args.exp_config
             
             # Load the environment
@@ -723,7 +762,7 @@ def main(args):
                 current_node = new_node
 
             n_traj += 1
-            n_success += 1 if expert_reward == 1 else 0
+            n_success += 1 if sft_state.reward == 1 else 0
             
             all_trajs.append(
                 {
@@ -949,6 +988,14 @@ if __name__ == "__main__":
         help="Number of previous ALFWorld observation/action steps in ReAct prompt.",
     )
 
+    parser.add_argument(
+        "--exclude_tree_dir",
+        type=str,
+        default=None,
+        help=(
+            "Directory containing previous *_tree.pkl files. Tasks already present there will be skipped."
+        ),
+    )
 
         
     args = parser.parse_args()
