@@ -31,13 +31,15 @@ class QNet(nn.Module):
                         cache_dir=training_args.cache_dir,
                         trust_remote_code=model_args.trust_remote_code,
                         attn_implementation="flash_attention_2",
-                        torch_dtype=torch.float16
+                        torch_dtype=torch.bfloat16,
                     )
             self.config = self.llama.config
         else:
             raise ValueError(f'Invalid task_mode: {task_mode}')
         self.config = self.llama.config
-        self.config.pad_token_id = 0
+        if pad_token_id is not None:
+            self.config.pad_token_id = pad_token_id
+
         self.llama = self.llama.bfloat16()
         # Freeze the llama
         # for param in self.llama.parameters():
@@ -54,26 +56,31 @@ class QNet(nn.Module):
             print('Applying sigmoid to the output')
         
     def forward(self, input_ids, attention_mask):
-        outputs = self.llama(
-            input_ids=input_ids, 
-            attention_mask=attention_mask, 
-            output_hidden_states=True
+        base_model = getattr(self.llama, "model", self.llama,)
+
+        outputs = base_model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            use_cache=False,
+            return_dict=True,
         )
-        hidden_states = outputs.hidden_states[-1]
+
+        hidden_states = outputs.last_hidden_state
+
         logits = self.mlp(hidden_states)
         
         batch_size = input_ids.shape[0]
         
-        if self.config.pad_token_id is None:
-            if batch_size != 1:
-                raise ValueError("Cannot handle batch sizes > 1 if no padding token is defined.")
-            sequence_lengths = -1
-        else:
-            # Compute sequence lengths accounting for padding
-            sequence_lengths = torch.eq(input_ids, self.config.pad_token_id).int().argmax(-1) - 1
-            sequence_lengths = sequence_lengths % input_ids.shape[-1]
-            sequence_lengths = sequence_lengths.to(logits.device)
-            # print(f'sequence_lengths:{sequence_lengths}')
+        sequence_lengths = attention_mask.long().sum(dim=1) - 1
+
+        sequence_lengths = torch.clamp(
+            sequence_lengths,
+            min=0,
+            max=input_ids.size(1) - 1,
+        )
+
+        sequence_lengths = sequence_lengths.to(logits.device)
+
         # print(sequence_lengths)
         if self.mode == 'each':
             pooled_logits = logits[torch.arange(batch_size, device=logits.device), :sequence_lengths[0]]
@@ -119,18 +126,24 @@ class QNet(nn.Module):
         """
         # Load the configuration to determine model parameters
         config_path = os.path.join(load_directory, "config.json")
-        if os.path.exists(config_path):
-            config = AutoConfig.from_pretrained(config_path)
-            hidden_size = config.hidden_size  # example of pulling a needed param
-        else:
-            hidden_size = 4096  # default or error handling
+        if not os.path.exists(config_path):
+            raise FileNotFoundError(
+                f"QNet checkpoint does not contain config.json: {load_directory}"
+            )
+
+        config = AutoConfig.from_pretrained(load_directory)
+
+        hidden_size = config.hidden_size
 
         # Create an instance of the model with required initial parameters
         model = cls(hidden_size, args, accelerator, no_load=True, model_args=args)
 
         # Load the state dict
         state_dict_path = os.path.join(load_directory, "pytorch_model.bin")
-        state_dict = torch.load(state_dict_path)
+        state_dict = torch.load(
+            state_dict_path,
+            map_location="cpu",
+        )
 
         # If an Accelerator object is provided, use it to correctly load the state dict
         if accelerator:

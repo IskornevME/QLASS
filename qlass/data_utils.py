@@ -103,6 +103,39 @@ def get_chat_template(model_path: str) -> ChatTemplate:
     assert False, f"ChatTemplate not implemented for {model_path}"
 
 
+def is_qwen3_model(model_path: str) -> bool:
+    return "qwen3" in str(model_path).lower()
+
+
+def render_chat_prompt(
+    messages,
+    tokenizer,
+    model_path,
+    add_generation_prompt=False,
+):
+    if is_qwen3_model(model_path):
+        if not getattr(tokenizer, "chat_template", None):
+            raise ValueError(
+                f"Qwen3 tokenizer has no chat_template: {model_path}"
+            )
+
+        return tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=add_generation_prompt,
+        )
+
+    chat = get_chat_template(model_path)
+
+    if add_generation_prompt:
+        return chat.get_prompt(
+            messages
+            + [{"role": "assistant", "content": None}]
+        )
+
+    return chat.get_prompt(messages)
+
+
 def rank0_print(message):
     # Assuming rank 0 is determined by some condition, e.g., an environment variable or a global variable
     rank = int(os.getenv('RANK', '0'))
@@ -211,7 +244,9 @@ def preprocess(
     model_path: str,
     rewards: List[float] = None,
 ) -> Dict:
-    chat:ChatTemplate = get_chat_template(model_path)
+    is_qwen3 = is_qwen3_model(model_path)
+    chat = None if is_qwen3 else get_chat_template(model_path)
+
     roles = {"human": "user", "gpt": "assistant"}
     roles_list = ["user", "assistant"]
     max_length = 0
@@ -233,20 +268,30 @@ def preprocess(
             messages.append(
                 {"role": role, "content": sentence["value"]}
             )
-        conversations.append(chat.get_prompt(messages))
+        conversations.append(
+            render_chat_prompt(
+                messages=messages,
+                tokenizer=tokenizer,
+                model_path=model_path,
+                add_generation_prompt=False,
+            )
+        )
 
     # Tokenize conversations
     # rank0_print("Tokenizing conversations...")
 
     # check whether dist is initialized
     if not dist.is_initialized():
-        input_ids = tokenizer(
+        encoded = tokenizer(
             conversations,
             return_tensors="pt",
             padding="max_length",
             max_length=tokenizer.model_max_length,
             truncation=True,
-        ).input_ids
+        )
+
+        input_ids = encoded.input_ids
+        attention_mask = encoded.attention_mask
     # else:
     #     # Tokenize conversations only at rank 0 and then using all_gather to broadcast the tokenized conversations
     #     rank = int(os.getenv('RANK', '0'))
@@ -272,14 +317,16 @@ def preprocess(
     #     # Cast input_ids back to the cpu
     #     input_ids = input_ids.to(torch.device("cpu"))
     else:
-        # Safer: tokenize on each rank to avoid broadcasting a huge tensor via NCCL
-        input_ids = tokenizer(
+        encoded = tokenizer(
             conversations,
             return_tensors="pt",
             padding="max_length",
             max_length=tokenizer.model_max_length,
             truncation=True,
-        ).input_ids
+        )
+
+        input_ids = encoded.input_ids
+        attention_mask = encoded.attention_mask
 
     # When no rewards are provided, we need to mask the non-assistant tokens to do SFT
     if rewards is None:
@@ -297,7 +344,7 @@ def preprocess(
     return dict(
         input_ids=input_ids,
         labels=targets,
-        attention_mask=input_ids.ne(tokenizer.pad_token_id),
+        attention_mask=attention_mask,
     )
 
 if __name__ == '__main__':

@@ -160,7 +160,7 @@ def collect_q_data_from_a_tree(node, require_critic_state=False):
 
     return data
 
-def collect_r_data_from_a_tree(node):
+def collect_r_data_from_a_tree(node, require_critic_state=False):
     data = []
     def recurse(node):
         if node.action and node.q_value is not None :
@@ -168,7 +168,10 @@ def collect_r_data_from_a_tree(node):
             if not "Root" in node.action:
                 #print("node.action",node.action)
                 assert isinstance(node.action, dict) and node.action['from']=='gpt'
-                traj = get_node_critic_conversation(node)
+                traj = get_node_critic_conversation(
+                    node,
+                    require_critic_state=require_critic_state,
+                )
             entry = {
                 'conversations': traj,
                 'label': node.reward,
@@ -206,7 +209,7 @@ def update_depth_q_values(node,height,gamma=0.9):
             update_depth_q_values(child,height-1,gamma=gamma)
         node.q_value = node.reward + gamma * max([child.q_value for child in node.children])
     
-def collect_q_data_from_trees_unpruned(tree_pth,save_q_pth):
+def collect_q_data_from_trees_unpruned(tree_pth, save_q_pth, require_critic_state=False,):
     # Collect q data from tree files
     trees = load_trees(tree_pth)
     q_data_ls = []
@@ -218,7 +221,10 @@ def collect_q_data_from_trees_unpruned(tree_pth,save_q_pth):
             post_processed_t = t['tree']
             post_processed_t.update_rewards()
             update_depth_q_values(post_processed_t,height=5,gamma=0.9)
-            q_data = collect_q_data_from_a_tree(post_processed_t)
+            q_data = collect_q_data_from_a_tree(
+                post_processed_t,
+                require_critic_state=require_critic_state,
+            )
             q_data = normalize_data(q_data, 'label')
             q_data = [{'id': id, **entry} for entry in q_data]
             q_data_ls.extend(q_data)
@@ -278,7 +284,7 @@ def collect_vanilla_q_data_from_trees_unpruned(
     with open(save_q_pth, 'w') as f:
         json.dump(q_data_ls, f, indent=4)
 
-def collect_r_data_from_trees_unpruned(tree_pth,save_r_pth):
+def collect_r_data_from_trees_unpruned(tree_pth, save_r_pth, require_critic_state=False):
     # Collect q data from tree files
     trees = load_trees(tree_pth)
     r_data_ls = []
@@ -288,7 +294,10 @@ def collect_r_data_from_trees_unpruned(tree_pth,save_r_pth):
             # post_processed_t = post_process_tree(t['tree'])
             post_processed_t = t['tree']
             post_processed_t.update_rewards()
-            r_data = collect_r_data_from_a_tree(post_processed_t)
+            r_data = collect_r_data_from_a_tree(
+                post_processed_t,
+                require_critic_state=require_critic_state,
+            )
             
             r_data = normalize_data(r_data, 'label')
             r_data = [{'id': id, **entry} for entry in r_data]
@@ -314,12 +323,9 @@ def main(args):
         )
     combined_traj_file = os.path.join(args.data_path, 'combined_traj.jsonl')
     combined_tree_file = os.path.join(args.data_path, 'combined_tree.pkl')
-    q_file = os.path.join(args.data_path, 'q_data.jsonl')
-    r_file = os.path.join(args.data_path, 'r_data.jsonl')
     # Combined slices
     combine_jsonl(jsonl_files, combined_traj_file)
     combine_pkl(pkl_files, combined_tree_file)
-    q_file = 'data/train/'+args.task+'/explore_v2/'+f'{args.q_type}.jsonl'
     if args.output_path is not None:
         q_file = args.output_path
     else:
@@ -339,9 +345,9 @@ def main(args):
             seed=args.seed,
         )
     elif args.q_type == 'pseudo_depth':
-        collect_q_data_from_trees_unpruned(combined_tree_file, q_file) ## pseudo children nodes
+        collect_q_data_from_trees_unpruned(combined_tree_file, q_file, require_critic_state=args.require_critic_state,) ## pseudo children nodes
     elif args.q_type == 'reward':
-        collect_r_data_from_trees_unpruned(combined_tree_file, q_file)
+        collect_r_data_from_trees_unpruned(combined_tree_file, q_file, require_critic_state=args.require_critic_state)
     else:
         raise ValueError(f"q_type {args.q_type} is not supported")
 

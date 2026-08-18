@@ -31,7 +31,11 @@ import transformers
 from transformers.trainer_pt_utils import LabelSmoother
 from qlass.q_network import QNet
 from qlass.q_trainer import Q_Trainer
-from qlass.data_utils import rank0_print, preprocess
+from qlass.data_utils import (
+    rank0_print,
+    preprocess,
+    is_qwen3_model,
+)
 import math
 import os
 import torch
@@ -56,6 +60,17 @@ class ModelArguments:
     padding_side: str = field(
         default="right", metadata={"help": "The padding side in tokenizer"}
     )
+
+    truncation_side: str = field(
+        default="right",
+        metadata={"help": "The truncation side used by the tokenizer."},
+    )
+
+    qnet_mode: str = field(
+        default="each",
+        metadata={"help": "QNet pooling mode: each or final."},
+    )
+
     apply_sigmoid: bool = field(
         default=False, metadata={"help": "Apply sigmoid to the output of the q network"}
     )
@@ -182,21 +197,32 @@ class SupervisedDataset_Q(Dataset):
 
         rank0_print("Formatting inputs...")
 
-        chat = get_chat_template(model_path)
-        max_prompt_tokens = int(3800)
-        keep_first_n = int(3)
-        min_tail_msgs = int(4)
+        if is_qwen3_model(model_path):
+            # New critic dataset already contains the exact compact critic_state + critic_action representation.
+            trimmed_sources = [example["conversations"] for example in raw_data]
+        else:
+            # Legacy QLASS / Llama behavior.
+            chat = get_chat_template(model_path)
 
-        trimmed_sources = []
-        for ex in raw_data:
-            msgs = _to_messages(ex["conversations"])
-            msgs = trim_turns_keep_first_n(
-                msgs, tokenizer=tokenizer, chat=chat,
-                max_prompt_tokens=max_prompt_tokens,
-                keep_first_n=keep_first_n,
-                min_tail_msgs=min_tail_msgs,
-            )
-            trimmed_sources.append(_to_conversations(msgs))
+            max_prompt_tokens = int(3800)
+            keep_first_n = int(3)
+            min_tail_msgs = int(4)
+
+            trimmed_sources = []
+
+            for ex in raw_data:
+                msgs = _to_messages(ex["conversations"])
+
+                msgs = trim_turns_keep_first_n(
+                    msgs,
+                    tokenizer=tokenizer,
+                    chat=chat,
+                    max_prompt_tokens=max_prompt_tokens,
+                    keep_first_n=keep_first_n,
+                    min_tail_msgs=min_tail_msgs,
+                )
+
+                trimmed_sources.append(_to_conversations(msgs))
 
         labels = [example["label"] for example in raw_data]
         data_dict = preprocess(trimmed_sources, tokenizer, model_path, labels)
@@ -274,9 +300,26 @@ def train():
         use_fast=False,
         trust_remote_code=model_args.trust_remote_code,
     )
-    if tokenizer.pad_token != tokenizer.unk_token:
-        tokenizer.pad_token = tokenizer.unk_token
-    
+    tokenizer.truncation_side = (
+        model_args.truncation_side
+    )
+
+    if is_qwen3_model(model_args.model_name_or_path):
+        if tokenizer.pad_token_id is None:
+            if tokenizer.eos_token is None:
+                raise ValueError("Qwen tokenizer has neither pad_token nor eos_token.")
+
+            tokenizer.pad_token = tokenizer.eos_token
+    else:
+        # Legacy QLASS behavior.
+        if tokenizer.pad_token != tokenizer.unk_token:
+            tokenizer.pad_token = tokenizer.unk_token
+
+    if model_args.qnet_mode not in {"each", "final"}:
+        raise ValueError(
+            f"Unsupported qnet_mode: {model_args.qnet_mode!r}"
+        )
+
     model = QNet(
         hidden_size=config.hidden_size,
         args=model_args,
@@ -284,6 +327,7 @@ def train():
         task_mode='eto',
         model_args=model_args,
         training_args=training_args,
+        mode=model_args.qnet_mode,
     ).to("cuda")
     
 

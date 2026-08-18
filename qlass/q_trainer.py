@@ -3630,6 +3630,11 @@ class Q_Trainer(Trainer):
         
         # save_function = self.accelerator.save
         self.accelerator.save(state_dict, os.path.join(output_dir, "pytorch_model.bin"))
+
+        unwrapped_model = self.accelerator.unwrap_model(self.model)
+
+        if hasattr(unwrapped_model, "config"):
+            unwrapped_model.config.save_pretrained(output_dir)
         
         if self.tokenizer is not None:
             self.tokenizer.save_pretrained(output_dir)

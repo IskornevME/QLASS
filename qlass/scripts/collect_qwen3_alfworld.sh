@@ -6,11 +6,11 @@ TASK="${TASK:-alfworld}"
 
 DATA_PATH="${DATA_PATH:-data/train/${TASK}/explore_qwen3_react_d5_s2_mpr3}"
 
-OUTPUT_PATH="${OUTPUT_PATH:-data/train/${TASK}/qwen3_react_qnet/vanilla.jsonl}"
-
 Q_TYPE="${Q_TYPE:-vanilla}"
 UPPER_NUM="${UPPER_NUM:-300}"
 SEED="${SEED:-42}"
+
+OUTPUT_PATH="${OUTPUT_PATH:-data/train/${TASK}/qwen3_react_qnet/${Q_TYPE}.jsonl}"
 
 
 if [[ ! -d "${DATA_PATH}" ]]; then
