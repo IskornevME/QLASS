@@ -1,0 +1,6 @@
+{
+  "transformer_layer_cls_to_wrap": [
+    "Qwen3DecoderLayer"
+  ],
+  "activation_checkpointing": true
+}

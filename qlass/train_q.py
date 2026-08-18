@@ -328,8 +328,7 @@ def train():
         model_args=model_args,
         training_args=training_args,
         mode=model_args.qnet_mode,
-    ).to("cuda")
-    
+    )
 
     data_module = make_supervised_data_module(tokenizer=tokenizer, data_args=data_args, model_path=model_args.model_name_or_path)
     

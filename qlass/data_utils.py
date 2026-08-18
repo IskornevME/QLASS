@@ -280,6 +280,7 @@ def preprocess(
     # Tokenize conversations
     # rank0_print("Tokenizing conversations...")
 
+    add_special_tokens = not is_qwen3
     # check whether dist is initialized
     if not dist.is_initialized():
         encoded = tokenizer(
@@ -288,6 +289,7 @@ def preprocess(
             padding="max_length",
             max_length=tokenizer.model_max_length,
             truncation=True,
+            add_special_tokens=add_special_tokens,
         )
 
         input_ids = encoded.input_ids
@@ -323,6 +325,7 @@ def preprocess(
             padding="max_length",
             max_length=tokenizer.model_max_length,
             truncation=True,
+            add_special_tokens=add_special_tokens,
         )
 
         input_ids = encoded.input_ids

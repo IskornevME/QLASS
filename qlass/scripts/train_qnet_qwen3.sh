@@ -67,11 +67,14 @@ mkdir -p "${OUTPUT_DIR}"
 # Python environment
 # -----------------------------------------------------------------------------
 
-TRAIN_PYTHON="${TRAIN_PYTHON:-/home/m.iskornev/miniforge3/envs/qlass_qwen_server/bin/python}"
+TRAIN_PYTHON="${TRAIN_PYTHON:-/home/m.iskornev/miniforge3/envs/qlass_qwen_qnet/bin/python}"
 
 
 "${TRAIN_PYTHON}" - <<'PY'
 from packaging.version import Version
+import torch
+import accelerate
+import datasets
 import transformers
 
 minimum = Version("4.51.0")
@@ -170,13 +173,11 @@ CUDA_VISIBLE_DEVICES="${GPU_LIST}" \
     --save_total_limit 2 \
     --logging_steps 5 \
     --fsdp "full_shard auto_wrap" \
-    --fsdp_transformer_layer_cls_to_wrap Qwen3DecoderLayer \
+    --fsdp_config qlass/configs/fsdp_qwen3.json \
     --model_max_length "${QNET_MODEL_MAX_LENGTH}" \
-    --gradient_checkpointing True \
     --lazy_preprocess False \
     --remove_unused_columns False \
     --seed "${SEED}" \
-    --data_seed "${SEED}" \
     --report_to none
 
 
