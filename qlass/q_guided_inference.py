@@ -90,8 +90,76 @@ def perturb_messages(instruction, messages, task_name="webshop"):
         raise NotImplementedError(f"We do not support the task: {task_name}")
 
 @torch.no_grad()
-def evaluate_trajs_qnet_v2(model, tokenizer, new_state, batch_size=1, disable_tqdm=False, model_name='/mnt/model/Llama-2-7b-chat-hf/', debug=False):
+def evaluate_trajs_qnet_v2(
+    model,
+    tokenizer,
+    new_state=None,
+    batch_size=1,
+    disable_tqdm=False,
+    model_name='/mnt/model/Llama-2-7b-chat-hf/',
+    debug=False,
+    critic_conversation=None,
+):
     q_values = []
+
+    if critic_conversation is not None:
+        from qlass.data_utils import preprocess, is_qwen3_model
+
+        if not is_qwen3_model(model_name):
+            raise ValueError("Explicit ReAct critic_conversation currently expects a Qwen3 QNet.")
+
+        device = next(model.parameters()).device
+
+        max_prompt_tokens = int(
+            getattr(model, "_qnet_max_prompt_tokens", getattr(tokenizer, "model_max_length", 8192))
+        )
+
+        old_side = tokenizer.truncation_side
+        old_max_length = tokenizer.model_max_length
+
+        try:
+            # Must match QNet training.
+            tokenizer.truncation_side = "left"
+            tokenizer.model_max_length = max_prompt_tokens
+
+            data_dict = preprocess(
+                [critic_conversation],
+                tokenizer,
+                model_name,
+                [0.0],
+                padding="longest",
+            )
+
+        finally:
+            tokenizer.truncation_side = old_side
+            tokenizer.model_max_length = old_max_length
+
+        input_ids = data_dict["input_ids"].to(device)
+        attention_mask = data_dict["attention_mask"].to(device)
+
+        q_output = model(input_ids, attention_mask=attention_mask,)
+
+        if isinstance(q_output, (tuple, list)):
+            q_output = q_output[0]
+
+        if q_output.dim() == 3 and q_output.size(-1) == 1:
+            q_output = q_output.squeeze(-1)
+
+        # New Qwen QNet was trained with mode="final" therefore it must return exactly one scalar per example.
+        if q_output.dim() != 2 or q_output.size(1) != 1:
+            raise RuntimeError(
+                "Expected final-mode QNet output with shape [B, 1], got "
+                f"{tuple(q_output.shape)}"
+            )
+
+        q_values = q_output[:, 0].detach().float().cpu().tolist()
+
+        if debug:
+            print("QNet critic conversation:", critic_conversation)
+            print("QNet value:", q_values[0])
+
+        return q_values
+
     # sources = [new_state.to_dict()['conversations'][:-1]]
     # if not disable_tqdm:
     #     progress = tqdm.tqdm(total=len(sources), desc="Evaluating Trajectories")
@@ -448,6 +516,51 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
     return result if np.isfinite(result) else default
 
 
+def _build_react_qnet_conversation(
+    actor_messages: Sequence[Mapping[str, Any]],
+    raw_action: str,
+) -> List[Dict[str, str]]:
+    """
+    Build exactly the representation used to train the Qwen ReAct QNet:
+        critic_state + critic_action.
+    """
+
+    role_map = {
+        "user": "human",
+        "assistant": "gpt",
+    }
+
+    conversations = []
+
+    for message in actor_messages:
+        role = message["role"]
+
+        if role not in role_map:
+            raise ValueError(f"Unsupported role in ReAct critic state: {role!r}")
+
+        conversations.append(
+            {
+                "from": role_map[role],
+                "value": str(message["content"]).strip(),
+            }
+        )
+
+    # build_react_actor_messages() currently produces exactly one user message
+    if len(conversations) != 1 or conversations[0]["from"] != "human":
+        raise ValueError(
+            f"Unexpected ALFWorld ReAct critic state: {conversations!r}"
+        )
+
+    conversations.append(
+        {
+            "from": "gpt",
+            "value": str(raw_action).strip(),
+        }
+    )
+
+    return conversations
+
+
 def _score_candidate_base(
     *,
     critic_backend: str,
@@ -457,6 +570,7 @@ def _score_candidate_base(
     qnet: Optional[Any],
     qnet_tokenizer: Optional[Any],
     qnet_model_name: Optional[str],
+    critic_conversation: Optional[List[Dict[str, str]]],
     llm_critic: Optional[Any],
 ) -> tuple[
     float,
@@ -494,6 +608,7 @@ def _score_candidate_base(
                 disable_tqdm=True,
                 model_name=qnet_model_name,
                 debug=args.debug,
+                critic_conversation=critic_conversation,
             )[0]
         )
 
@@ -746,14 +861,8 @@ def main(args):
         if args.exp_config != "alfworld":
             raise ValueError("--alfworld_react_prompt is supported only for ALFWorld.")
 
-        if args.best_of_N != 1:
-            raise ValueError("--alfworld_react_prompt baseline requires --best_of_N=1.")
-
-        if args.critic_backend != "none":
-            raise ValueError("--alfworld_react_prompt baseline requires --critic_backend=none.")
-
-        if args.enable_memory_correction:
-            raise ValueError("--alfworld_react_prompt baseline should be run without memory.")
+        if args.num_icl_examples != 0:
+            raise ValueError("ALFWorld ReAct mode requires --num_icl_examples=0.")
 
     if args.enable_memory_action_augmentation and not args.enable_memory_correction:
         raise ValueError(
@@ -840,12 +949,27 @@ def main(args):
 
         qnet_model_name = args.qnet_model_name or qnet_tokenizer_path
 
-        qnet_tokenizer = AutoTokenizer.from_pretrained(qnet_tokenizer_path, model_max_length=4096, use_fast=False)
+        qnet_tokenizer = AutoTokenizer.from_pretrained(
+                qnet_tokenizer_path,
+                model_max_length=args.qnet_max_prompt_tokens,
+                padding_side="right",
+                truncation_side="left",
+                use_fast=False,
+        )
 
-        # Preserve the original QLASS behavior
-        # only inside the QNet branch.
-        if qnet_tokenizer.pad_token != qnet_tokenizer.unk_token:
-            qnet_tokenizer.pad_token = qnet_tokenizer.unk_token
+        qnet_is_qwen3 = "qwen3" in str(qnet_model_name).lower()
+
+        if qnet_is_qwen3:
+            if qnet_tokenizer.pad_token_id is None:
+                if qnet_tokenizer.eos_token is None:
+                    raise ValueError("Qwen QNet tokenizer has neither pad_token nor eos_token.")
+
+                qnet_tokenizer.pad_token = qnet_tokenizer.eos_token
+
+        else:
+            # Legacy QLASS / Llama path.
+            if qnet_tokenizer.pad_token != qnet_tokenizer.unk_token:
+                qnet_tokenizer.pad_token = qnet_tokenizer.unk_token
 
         qnet._qnet_max_prompt_tokens = args.qnet_max_prompt_tokens
         qnet._qnet_keep_first_n = args.qnet_keep_first_n
@@ -1306,6 +1430,12 @@ def main(args):
                             candidate_id=idx,
                         )
 
+                        critic_conversation = None
+                        if args.alfworld_react_prompt and args.critic_backend == "qnet":
+                            critic_conversation = (
+                                _build_react_qnet_conversation(actor_messages=cur_state_history, raw_action=raw_action)
+                            )
+
                         observation_after_action, new_state = env.step(raw_action)
 
                         base_score, score_source, critic_diagnostics = _score_candidate_base(
@@ -1316,6 +1446,7 @@ def main(args):
                             qnet=qnet,
                             qnet_tokenizer=qnet_tokenizer,
                             qnet_model_name=qnet_model_name,
+                            critic_conversation=critic_conversation,
                             llm_critic=llm_critic,
                         )
 
@@ -1412,6 +1543,19 @@ def main(args):
                                 f"traj_actions={traj_actions}\n"
                             )
 
+                            critic_conversation = None
+                            if args.alfworld_react_prompt and args.critic_backend == "qnet":
+                                critic_state_messages = (
+                                    env.build_react_actor_messages(history_length=args.alfworld_history_length)
+                                )
+
+                                critic_conversation = (
+                                    _build_react_qnet_conversation(
+                                        actor_messages=critic_state_messages,
+                                        raw_action=raw_action,
+                                    )
+                                )
+
                             observation_after_action, new_state = env.step(raw_action)
 
                             candidate_id = len(candidate_records)
@@ -1424,6 +1568,7 @@ def main(args):
                                 qnet=qnet,
                                 qnet_tokenizer=qnet_tokenizer,
                                 qnet_model_name=qnet_model_name,
+                                critic_conversation=critic_conversation,
                                 llm_critic=llm_critic,
                             )
 

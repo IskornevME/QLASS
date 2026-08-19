@@ -51,7 +51,7 @@ fi
 
 Q_DATA_PATH="${Q_DATA_PATH:-data/train/${TASK}/qwen3_react_qnet/vanilla.jsonl}"
 
-Q_MODEL_NAME="${Q_MODEL_NAME:-${EXP_NAME}-${POLICY_MODEL_NAME}-${TASK}-Q}"
+Q_MODEL_NAME="${Q_MODEL_NAME:-${EXP_NAME}-${POLICY_MODEL_NAME}-${TASK}-Q-v2}"
 
 OUTPUT_DIR="${OUTPUT_DIR:-${MODEL_PATH%/}/${Q_MODEL_NAME}}"
 

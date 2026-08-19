@@ -37,21 +37,21 @@ if [[ "${ALFWORLD_REACT_MODE}" == "1" ]]; then
     exit 1
   fi
 
-  # Pure Qwen actor baseline.
-  CRITIC_BACKEND="none"
-  BON="1"
-
-  # Match AdaMEM ALFWorld setup.
+  # AdaMEM-style Qwen actor input.
   ICL="0"
   MAX_STEPS="50"
   POLICY_MAX_NEW_TOKENS="2048"
-
-  # AdaMEM uses temperature=0.7.
   POLICY_TEMPERATURE="0.7"
 
-  # No memory in the baseline.
-  ENABLE_MEMORY="0"
-  ENABLE_MEMORY_ACTION_AUGMENTATION="0"
+  # IMPORTANT:
+  # Do not override CRITIC_BACKEND, BON or memory here.
+  # They define the experiment:
+  #
+  # actor-only:
+  #   CRITIC_BACKEND=none BON=1
+  #
+  # QLASS:
+  #   CRITIC_BACKEND=qnet BON=2
 fi
 
 if [[ ! -d "${POLICY_MODEL_PATH}" ]]; then
@@ -190,7 +190,7 @@ case "${CRITIC_BACKEND}" in
 
   if [[ ! -d "${QNET_TOKENIZER_PATH}" ]]; then
     echo \
-      "[ERROR] Llama QNet tokenizer directory not found: " \
+      "[ERROR] QNet tokenizer directory not found: " \
       "${QNET_TOKENIZER_PATH}" \
       >&2
     exit 1
@@ -232,7 +232,7 @@ fi
 RUN_TAG="${DATA_PREFIX}_${CRITIC_BACKEND}_bon${BON}_traj${N_TRAJS}_steps${MAX_STEPS}_${PROMPT_TAG}_${SPLIT}_run${RUN_ID}_${MEMORY_TAG}_${TERMINAL_TAG}_${AUG_TAG}"
 
 if [[ "${CRITIC_BACKEND}" == "qnet" ]]; then
-  RUN_FAMILY="qwen_llama_qnet"
+  RUN_FAMILY="qwen_qnet"
 else
   # Preserve the existing output location for llm_judge and actor-only runs.
   RUN_FAMILY="qwen_llm_critic"

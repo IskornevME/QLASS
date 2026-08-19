@@ -243,6 +243,7 @@ def preprocess(
     tokenizer: transformers.PreTrainedTokenizer,
     model_path: str,
     rewards: List[float] = None,
+    padding="max_length",
 ) -> Dict:
     is_qwen3 = is_qwen3_model(model_path)
     chat = None if is_qwen3 else get_chat_template(model_path)
@@ -286,7 +287,7 @@ def preprocess(
         encoded = tokenizer(
             conversations,
             return_tensors="pt",
-            padding="max_length",
+            padding=padding,
             max_length=tokenizer.model_max_length,
             truncation=True,
             add_special_tokens=add_special_tokens,
@@ -322,7 +323,7 @@ def preprocess(
         encoded = tokenizer(
             conversations,
             return_tensors="pt",
-            padding="max_length",
+            padding=padding,
             max_length=tokenizer.model_max_length,
             truncation=True,
             add_special_tokens=add_special_tokens,
