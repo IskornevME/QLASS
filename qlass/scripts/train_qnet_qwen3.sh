@@ -164,6 +164,7 @@ CUDA_VISIBLE_DEVICES="${GPU_LIST}" \
     --num_train_epochs "${NUM_EPOCHS}" \
     --per_device_train_batch_size "${MICRO_BATCH_SIZE}" \
     --gradient_accumulation_steps "${GRAD_ACCUM}" \
+    --optim adamw_torch \
     --learning_rate "${LEARNING_RATE}" \
     --weight_decay 0.0 \
     --warmup_ratio 0.03 \
