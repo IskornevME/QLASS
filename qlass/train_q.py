@@ -99,21 +99,54 @@ class TrainingArguments(transformers.TrainingArguments):
     )
 
 
-def trainer_save_model_safe(trainer: transformers.Trainer):
-    try:
-        from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-        from torch.distributed.fsdp import StateDictType, FullStateDictConfig
+# def trainer_save_model_safe(trainer: transformers.Trainer):
+#     try:
+#         from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+#         from torch.distributed.fsdp import StateDictType, FullStateDictConfig
 
-        # Если реально FSDP - сохраняем через FULL_STATE_DICT как у авторов
-        if isinstance(trainer.model, FSDP):
-            save_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
-            with FSDP.state_dict_type(trainer.model, StateDictType.FULL_STATE_DICT, save_policy):
-                trainer.save_model()
-        else:
-            trainer.save_model()
-    except Exception:
-        # single GPU / без FSDP
-        trainer.save_model()
+#         # Если реально FSDP - сохраняем через FULL_STATE_DICT как у авторов
+#         if isinstance(trainer.model, FSDP):
+#             save_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+#             with FSDP.state_dict_type(trainer.model, StateDictType.FULL_STATE_DICT, save_policy):
+#                 trainer.save_model()
+#         else:
+#             trainer.save_model()
+#     except Exception:
+#         # single GPU / без FSDP
+#         trainer.save_model()
+
+def trainer_save_model_safe(
+    trainer: transformers.Trainer,
+):
+    """
+    Save a regular, inference-loadable full state dict.
+
+    Intermediate FSDP checkpoints may remain sharded,
+    but the final model must be FULL_STATE_DICT.
+    """
+
+    if trainer.is_fsdp_enabled:
+        fsdp_plugin = (
+            trainer.accelerator.state.fsdp_plugin
+        )
+
+        rank0_print(
+            "[FINAL_SAVE] FSDP state dict type "
+            f"before: {fsdp_plugin.state_dict_type}"
+        )
+
+        fsdp_plugin.set_state_dict_type(
+            "FULL_STATE_DICT"
+        )
+
+        rank0_print(
+            "[FINAL_SAVE] FSDP state dict type "
+            f"after: {fsdp_plugin.state_dict_type}"
+        )
+
+    trainer.save_model(
+        trainer.args.output_dir
+    )
 
 # def trainer_save_model_safe(trainer: transformers.Trainer):
 #     from torch.distributed.fsdp import FullyShardedDataParallel as FSDP

@@ -64,7 +64,7 @@ fi
 # SGLang server and QLASS client may live in separate environments.
 # -----------------------------------------------------------------------------
 SGLANG_PYTHON="${SGLANG_PYTHON:-/home/m.iskornev/miniforge3/envs/qlass_qwen_server/bin/python}"
-QLASS_PYTHON="${QLASS_PYTHON:-/home/m.iskornev/miniforge3/envs/my_env/bin/python}"
+QLASS_PYTHON="${QLASS_PYTHON:-/home/m.iskornev/miniforge3/envs/qlass_qwen_infer/bin/python}"
 
 
 # -----------------------------------------------------------------------------

@@ -599,6 +599,11 @@ def _score_candidate_base(
                 "QNet backend is not initialized."
             )
 
+        if  args.alfworld_react_prompt and critic_conversation is None:
+            raise RuntimeError(
+                "ALFWorld ReAct QNet scoring requires explicit critic_state + critic_action."
+            )
+
         score = float(
             evaluate_trajs_qnet_v2(
                 qnet,
