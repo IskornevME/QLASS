@@ -198,7 +198,7 @@ class AlfWorldEnv(BaseEnv):
             self.state.success = False
             self.state.finished = False
             self.state.reward=0
-            observation = f"Observation: Error Input. Your input must contains 'Action: '"
+            observation = "Observation: Error Input. Your response must contain an action inside <action>...</action> tags."
             self.react_history.append(
                 (react_observation_before, "__invalid_action__")
             )

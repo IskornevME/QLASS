@@ -754,30 +754,107 @@ def _replace_action_line(raw_action: str, action_command: str) -> str:
     return f"{text}\nAction: {action_command}".strip()
 
 
+def _extract_reasoning_from_raw_action(
+    raw_action: str,
+) -> str:
+    """
+    Extract reasoning from either the new Qwen ReAct format
+
+        <think>...</think>
+        <action>...</action>
+
+    or the legacy QLASS format
+
+        Thought: ...
+        Action: ...
+
+    Only the reasoning is reused. The action itself is always reconstructed from the current admissible command.
+    """
+
+    text = str(raw_action or "").strip()
+
+    if not text:
+        return ""
+
+    # New Qwen / AdaMEM ReAct format.
+    match = re.search(r"<think>\s*(.*?)\s*</think>", text, flags=re.DOTALL | re.IGNORECASE)
+
+    if match:
+        return match.group(1).strip()
+
+    # Legacy QLASS format.
+    match = re.search(r"Thought:\s*(.*?)(?:\n\s*Action:|$)", text, flags=re.DOTALL | re.IGNORECASE,)
+
+    if match:
+        return match.group(1).strip()
+
+    return ""
+
+
 def _build_memory_augmented_raw_action(
     action_command: str,
     *,
     action_format: str,
     retrieved_raw_action_exact: str = "",
+    react_format: bool = False,
 ) -> str:
-    """Build assistant message for a memory-augmented ALFWorld command.
-
-    Modes:
-    - action_only:
-        no reasoning, only the current admissible command.
-    - generic_thought:
-        a short generic ReAct-style thought plus the current command.
-    - retrieved_thought_exact_only:
-        use retrieved reasoning only when there was an exact action match in memory; otherwise fall back to generic_thought.
     """
+    Build an assistant response for a memory-augmented ALFWorld command.
+
+    In ReAct mode:
+        <think>...</think>
+        <action>...</action>
+
+    In legacy mode:
+        Thought: ...
+        Action: ...
+
+    The action command is always instantiated from the CURRENT admissible actions.
+    """
+
     action_command = str(action_command).strip()
+
+    generic_reasoning = "I should take an action that has worked in a similar state."
+
+    # --------------------------------------------------
+    # Qwen / AdaMEM ReAct format.
+    # --------------------------------------------------
+    if react_format:
+
+        if action_format == "action_only":
+            return (
+                f"<action>{action_command}</action>"
+            )
+
+        if action_format == "generic_thought":
+            return (
+                f"<think>{generic_reasoning}</think>\n"
+                f"<action>{action_command}</action>"
+            )
+
+        if action_format == "retrieved_thought_exact_only":
+            reasoning = _extract_reasoning_from_raw_action(retrieved_raw_action_exact)
+
+            if not reasoning:
+                reasoning = generic_reasoning
+
+            return (
+                f"<think>{reasoning}</think>\n"
+                f"<action>{action_command}</action>"
+            )
+
+        raise ValueError(f"Unsupported memory_augmented_action_format: {action_format}")
+
+    # --------------------------------------------------
+    # Legacy QLASS format.
+    # --------------------------------------------------
 
     if action_format == "action_only":
         return f"Action: {action_command}"
 
     if action_format == "generic_thought":
         return (
-            "Thought: I should take an action that has worked in a similar state.\n"
+            f"Thought: {generic_reasoning}\n"
             f"Action: {action_command}"
         )
 
@@ -787,8 +864,9 @@ def _build_memory_augmented_raw_action(
                 raw_action=retrieved_raw_action_exact,
                 action_command=action_command,
             )
+
         return (
-            "Thought: I should take an action that has worked in a similar state.\n"
+            f"Thought: {generic_reasoning}\n"
             f"Action: {action_command}"
         )
 
@@ -1190,6 +1268,9 @@ def main(args):
                 "memory_augmented_action_format": args.memory_augmented_action_format,
                 "memory_initial_stats": correction_memory.stats(),
 
+                "alfworld_react_prompt": bool(args.alfworld_react_prompt),
+                "memory_augmented_action_syntax": ("qwen_react" if args.alfworld_react_prompt else "legacy"),
+
                 "critic_backend": args.critic_backend,
                 "critic_model_name": args.critic_model_name,
                 "critic_max_prompt_tokens": args.critic_max_prompt_tokens,
@@ -1527,7 +1608,22 @@ def main(args):
                                 action_command,
                                 action_format=args.memory_augmented_action_format,
                                 retrieved_raw_action_exact=aug_action.get("retrieved_raw_action_exact", ""),
+                                react_format=args.alfworld_react_prompt,
                             )
+
+                            try:
+                                parsed_augmented_action = str(env.parse_action(raw_action)).strip()
+                            except Exception as exc:
+                                raise RuntimeError(f"Failed to parse memory-augmented ReAct action.\nraw_action={raw_action!r}"
+                                ) from exc
+
+                            if parsed_augmented_action.lower() != str(action_command).strip().lower():
+                                raise RuntimeError(
+                                    "Memory-augmented action mismatch: "
+                                    f"expected={action_command!r}, "
+                                    f"parsed={parsed_augmented_action!r}, "
+                                    f"raw={raw_action!r}"
+                                )
 
                             # Replay to the current pre-action state, exactly as for policy candidates.
                             observation, state = env.reset(num_icl_examples=args.num_icl_examples)
@@ -2474,7 +2570,9 @@ if __name__ == "__main__":
         choices=["action_only", "generic_thought", "retrieved_thought_exact_only"],
         default="action_only",
         help=(
-            "How to format memory-augmented candidates before QNet scoring. "
+            "How to format memory-augmented candidates before critic scoring. "
+            "With --alfworld_react_prompt, candidates are rendered using "
+            "<think>/<action> tags. Otherwise the legacy Thought:/Action: format is used. "
             "retrieved_thought_exact_only uses stored reasoning only when the "
             "current admissible command exactly matches a positive retrieved memory action; "
             "otherwise it falls back to generic_thought."

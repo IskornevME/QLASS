@@ -80,7 +80,7 @@ QLASS_PYTHON="${QLASS_PYTHON:-/home/m.iskornev/miniforge3/envs/qlass_qwen_infer/
 #
 # qnet:
 #   GPU SERVER_GPU: Qwen actor via SGLang.
-#   GPU WORKER_GPU: original trained Llama QNet loaded locally by q_guided_inference.py.
+#   GPU WORKER_GPU: local trained QNet critic loaded locally by q_guided_inference.py.
 # -----------------------------------------------------------------------------
 SERVER_GPU="${SERVER_GPU:-0}"
 # Preserve the old behavior for actor-only and LLM-judge runs: no local GPU is exposed to q_guided_inference.py.
