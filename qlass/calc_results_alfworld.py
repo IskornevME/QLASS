@@ -179,34 +179,84 @@ for k in range(1, n_trajs + 1):
     print(f"  best_of_{k}: {best_of_k:.6f}")
 
 
+INVALID_ACTION_COMMAND = "__invalid_action__"
+
+
 def normalize_action(action):
     return re.sub(r"\s+", " ", str(action).strip().lower())
+
+
+def parse_logged_raw_action(raw_action):
+    """
+    Parse an action stored in old action_value_dict records.
+
+    Mirrors AlfWorldEnv.parse_action():
+      1. Qwen ReAct <action>...</action>
+      2. legacy QLASS Action: ...
+      3. malformed outputs -> one invalid-action sentinel
+    """
+    text = str(raw_action or "").strip()
+
+    match = re.search(r"<action>\s*(.*?)\s*</action>", text, flags=re.DOTALL | re.IGNORECASE)
+
+    if match:
+        return normalize_action(match.group(1))
+
+    match = re.search(r"Action:\s?(.*)", text, flags=re.DOTALL)
+
+    if match:
+        return normalize_action(match.group(1))
+
+    return INVALID_ACTION_COMMAND
+
+
+def iter_policy_actions_by_step(traj):
+    """
+    New runs:
+        use parsed action_command from critic_attempt_trace.
+
+    Old runs:
+        reconstruct action_command from raw responses stored in action_value_dict.
+    """
+    trace = traj.get("critic_attempt_trace")
+
+    if trace and trace.get("steps"):
+        for step in trace["steps"]:
+            actions = [normalize_action(candidate["action_command"])
+                for candidate in step["candidates"]
+                if candidate.get("candidate_source", "policy") == "policy"
+            ]
+
+            if actions:
+                yield int(step["step_id"]), actions
+
+        return
+
+    # Backward-compatible path for old experiments.
+    for step_id, step_candidates in enumerate(traj.get("action_value_dict", [])):
+        actions = []
+
+        for candidate in step_candidates:
+            if candidate.get("candidate_source", "policy") != "policy":
+                continue
+
+            raw_action = candidate.get("action", "")
+
+            actions.append(parse_logged_raw_action(raw_action))
+
+        if actions:
+            yield step_id, actions
 
 
 diversity_by_step = defaultdict(list)
 
 for trajs in trajs_by_task.values():
     for traj in trajs:
-        trace = traj.get("critic_attempt_trace")
-
-        if not trace:
-            continue
-
-        for step in trace["steps"]:
-            policy_candidates = [
-                candidate for candidate in step["candidates"]
-                if candidate["candidate_source"] == "policy"
-            ]
-
-            actions = [normalize_action(candidate["action_command"]) for candidate in policy_candidates]
-
-            if not actions:
-                continue
-
+        for step_id, actions in (iter_policy_actions_by_step(traj)):
             num_candidates = len(actions)
             num_unique = len(set(actions))
 
-            diversity_by_step[int(step["step_id"])].append(
+            diversity_by_step[step_id].append(
                 {
                     "num_candidates": num_candidates,
                     "num_unique": num_unique,

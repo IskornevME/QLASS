@@ -701,6 +701,8 @@ def _add_attempt_memory_to_critic_conversation(
         model_name=model_name,
     )
 
+    base_overflow_tokens = max(base_tokens - max_prompt_tokens, 0)
+
     diagnostics = {
         "attempt_memory_mode": mode,
         "attempt_memory_used": False,
@@ -709,8 +711,8 @@ def _add_attempt_memory_to_critic_conversation(
         "qnet_prompt_tokens_without_attempt_memory": int(base_tokens),
         "qnet_prompt_tokens_with_attempt_memory": int(base_tokens),
         "qnet_prompt_tokens_added_by_attempt_memory": 0,
-        "qnet_prompt_overflow_tokens": 0,
-        "qnet_prompt_would_truncate": False,
+        "qnet_prompt_overflow_tokens": int(base_overflow_tokens),
+        "qnet_prompt_would_truncate": bool(base_tokens > max_prompt_tokens),
         "attempt_memory_retention_ratio": 1.0,
     }
 
@@ -1754,10 +1756,12 @@ def main(args):
                             candidate_id=idx,
                         )
 
+                        observation_after_action, new_state = env.step(raw_action)
+
                         critic_conversation = None
                         critic_prompt_diagnostics = None
 
-                        if args.alfworld_react_prompt and args.critic_backend == "qnet":
+                        if not new_state.finished and args.alfworld_react_prompt and args.critic_backend == "qnet":
                             base_critic_conversation = _build_react_qnet_conversation(
                                 actor_messages=cur_state_history,
                                 raw_action=raw_action,
@@ -1772,7 +1776,12 @@ def main(args):
                                 max_prompt_tokens=args.qnet_max_prompt_tokens,
                             )
 
-                        observation_after_action, new_state = env.step(raw_action)
+                            # for debug
+                            if i == 0 and traj_id == 1 and n_turn == 0 and idx == 0:
+                                print("[DBG_CRITIC_ATTEMPT_MEMORY_PROMPT]")
+                                print(
+                                    json.dumps(critic_conversation, ensure_ascii=False, indent=2)
+                                )
 
                         base_score, score_source, critic_diagnostics = _score_candidate_base(
                             critic_backend=args.critic_backend,
@@ -1895,13 +1904,15 @@ def main(args):
                                 f"traj_actions={traj_actions}\n"
                             )
 
+                            critic_state_messages = None
+                            if args.alfworld_react_prompt and args.critic_backend == "qnet":
+                                critic_state_messages = env.build_react_actor_messages(history_length=args.alfworld_history_length)
+
+                            observation_after_action, new_state = env.step(raw_action)
+
                             critic_conversation = None
                             critic_prompt_diagnostics = None
-                            if args.alfworld_react_prompt and args.critic_backend == "qnet":
-                                critic_state_messages = (
-                                    env.build_react_actor_messages(history_length=args.alfworld_history_length)
-                                )
-
+                            if not new_state.finished and critic_state_messages is not None:
                                 base_critic_conversation = (
                                     _build_react_qnet_conversation(
                                         actor_messages=critic_state_messages,
@@ -1917,8 +1928,6 @@ def main(args):
                                     model_name=qnet_model_name,
                                     max_prompt_tokens=args.qnet_max_prompt_tokens,
                                 )
-
-                            observation_after_action, new_state = env.step(raw_action)
 
                             candidate_id = len(candidate_records)
 
@@ -2410,6 +2419,7 @@ def main(args):
                     },
                     "critic_attempt_memory_mode": args.critic_attempt_memory_mode,
                     "critic_attempt_memory_num_previous": args.critic_attempt_memory_num_previous,
+                    "critic_attempt_memory_source_attempt_ids": [int(attempt["attempt_id"]) for attempt in previous_critic_attempts],
                 }
                 if correction_memory is not None:
                     trajectory_record["memory_correction_summary"] = {
