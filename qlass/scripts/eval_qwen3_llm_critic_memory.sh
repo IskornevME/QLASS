@@ -108,6 +108,9 @@ N_TRAJS="${N_TRAJS:-3}"
 MAX_STEPS="${MAX_STEPS:-40}"
 MAX_TASKS="${MAX_TASKS:-}"
 
+CRITIC_ATTEMPT_MEMORY_MODE="${CRITIC_ATTEMPT_MEMORY_MODE:-none}"
+CRITIC_ATTEMPT_MEMORY_NUM_PREVIOUS="${CRITIC_ATTEMPT_MEMORY_NUM_PREVIOUS:-1}"
+
 SPLIT="${SPLIT:-test}"
 SLICE_NUM="${SLICE_NUM:-1}"
 SLICE_ID="${SLICE_ID:-0}"
@@ -223,13 +226,19 @@ else
   MEMORY_TAG="no_memory"
 fi
 
+if [[ "${CRITIC_ATTEMPT_MEMORY_MODE}" == "none" ]]; then
+  ATTEMPT_MEMORY_TAG="no_attempt_memory"
+else
+  ATTEMPT_MEMORY_TAG="attempt_memory_${CRITIC_ATTEMPT_MEMORY_MODE}_prev${CRITIC_ATTEMPT_MEMORY_NUM_PREVIOUS}"
+fi
+
 if [[ "${ALFWORLD_REACT_MODE}" == "1" ]]; then
   PROMPT_TAG="react50"
 else
   PROMPT_TAG="legacy_prompt"
 fi
 
-RUN_TAG="${DATA_PREFIX}_${CRITIC_BACKEND}_bon${BON}_traj${N_TRAJS}_steps${MAX_STEPS}_${PROMPT_TAG}_${SPLIT}_run${RUN_ID}_${MEMORY_TAG}_${TERMINAL_TAG}_${AUG_TAG}"
+RUN_TAG="${DATA_PREFIX}_${CRITIC_BACKEND}_bon${BON}_traj${N_TRAJS}_steps${MAX_STEPS}_${PROMPT_TAG}_${SPLIT}_run${RUN_ID}_${MEMORY_TAG}_${ATTEMPT_MEMORY_TAG}_${TERMINAL_TAG}_${AUG_TAG}"
 
 if [[ "${CRITIC_BACKEND}" == "qnet" ]]; then
   RUN_FAMILY="qwen_qnet"
@@ -348,6 +357,7 @@ if [[ "${CRITIC_BACKEND}" == "qnet" ]]; then
   echo "[CONFIG] QNet checkpoint: ${QNET_PATH}"
   echo "[CONFIG] QNet tokenizer:  ${QNET_TOKENIZER_PATH}"
   echo "[CONFIG] QNet model name: ${QNET_MODEL_NAME}"
+  echo "[CONFIG] QNet max tokens: ${QNET_MAX_PROMPT_TOKENS}"
   echo "[CONFIG] QNet GPU:        ${WORKER_GPU}"
 fi
 echo "[CONFIG] Server:           gpu=${SERVER_GPU}, tp=${SERVER_TP}, address=${POLICY_SERVER_ADDRESS}"
@@ -363,6 +373,8 @@ echo "[CONFIG] Max tasks:        ${MAX_TASKS:-all}"
 echo "[CONFIG] ALFWorld ReAct mode: ${ALFWORLD_REACT_MODE}"
 echo "[CONFIG] ICL examples:         ${ICL}"
 echo "[CONFIG] Policy max tokens:    ${POLICY_MAX_NEW_TOKENS}"
+echo "[CONFIG] Critic attempt memory: ${CRITIC_ATTEMPT_MEMORY_MODE}"
+echo "[CONFIG] Previous attempts:     ${CRITIC_ATTEMPT_MEMORY_NUM_PREVIOUS}"
 
 # -----------------------------------------------------------------------------
 # Start the SGLang server and guarantee cleanup on exit.
@@ -432,6 +444,14 @@ if [[ "${ALFWORLD_REACT_MODE}" == "1" ]]; then
   )
 fi
 
+ATTEMPT_MEMORY_ARGS=(
+  --critic_attempt_memory_mode \
+    "${CRITIC_ATTEMPT_MEMORY_MODE}"
+
+  --critic_attempt_memory_num_previous \
+    "${CRITIC_ATTEMPT_MEMORY_NUM_PREVIOUS}"
+)
+
 # -----------------------------------------------------------------------------
 # Build and run q_guided_inference.py.
 # Arrays avoid fragile backslash continuations and preserve empty groups.
@@ -453,6 +473,7 @@ INFERENCE_ARGS=(
   --policy_min_p "${POLICY_MIN_P}"
   --policy_presence_penalty "${POLICY_PRESENCE_PENALTY}"
   "${CRITIC_ARGS[@]}"
+  "${ATTEMPT_MEMORY_ARGS[@]}"
   --exp_name "${EXP_NAME}"
   --exp_path qlass/configs/task/
   --benchmark "${BENCHMARK}"

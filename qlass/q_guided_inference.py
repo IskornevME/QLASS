@@ -561,6 +561,221 @@ def _build_react_qnet_conversation(
     return conversations
 
 
+def _serialize_critic_attempt_memory(
+    previous_attempts: Sequence[Mapping[str, Any]],
+    mode: str,
+) -> str:
+    if mode == "none" or not previous_attempts:
+        return ""
+
+    if mode not in {"trajectory", "trajectory_with_scores"}:
+        raise ValueError(f"Unsupported critic attempt memory mode: {mode!r}")
+
+    include_scores = mode == "trajectory_with_scores"
+    blocks = []
+
+    for attempt in previous_attempts:
+        attempt_id = int(attempt["attempt_id"])
+        lines = [
+            f"=== PREVIOUS ATTEMPT {attempt_id} ===",
+        ]
+
+        for step in attempt["steps"]:
+            step_id = int(step["step_id"])
+
+            lines.extend(
+                [
+                    "",
+                    f"Step {step_id + 1}",
+                    "Observation:",
+                    str(step["observation_before_action"]).strip(),
+                ]
+            )
+
+            if include_scores:
+                lines.append("")
+                lines.append("Candidate actions considered:")
+
+                for candidate in step["candidates"]:
+                    action = json.dumps(candidate["action_command"], ensure_ascii=False)
+
+                    lines.append(
+                        f"- action={action}; "
+                        f"previous_base_score="
+                        f"{float(candidate['base_score']):.6f}; "
+                        f"score_source={candidate['score_source']}; "
+                        f"selected={bool(candidate['selected'])}"
+                    )
+
+            lines.extend(
+                [
+                    "",
+                    "Executed action:",
+                    str(step["selected_action"]).strip(),
+                    "",
+                    "Next observation:",
+                    str(step["observation_after_action"]).strip(),
+                ]
+            )
+
+        # Keep final outcome at the END of the memory block.
+        # With left truncation it is therefore more likely to survive.
+        lines.extend(
+            [
+                "",
+                f"Final success: {bool(attempt['success'])}",
+                f"Final reward: {float(attempt['final_reward']):.6f}",
+                f"Termination: {attempt['terminate_reason']}",
+                f"=== END PREVIOUS ATTEMPT {attempt_id} ===",
+            ]
+        )
+
+        blocks.append("\n".join(lines))
+
+    return (
+        "Previous attempt(s) at the same task are provided below as additional context.\n\n"
+        + "\n\n".join(blocks)
+    )
+
+
+def _count_qnet_conversation_tokens(
+    conversation: Sequence[Mapping[str, Any]],
+    *,
+    tokenizer: Any,
+    model_name: str,
+) -> int:
+    from qlass.data_utils import is_qwen3_model, render_chat_prompt
+
+    roles = {"human": "user", "gpt": "assistant"}
+
+    messages = []
+
+    for index, message in enumerate(conversation):
+        role = roles[message["from"]]
+
+        expected_role = "user" if index % 2 == 0 else "assistant"
+
+        if role != expected_role:
+            raise ValueError(
+                "Unexpected critic conversation role order: "
+                f"index={index}, role={role!r}"
+            )
+
+        messages.append(
+            {
+                "role": role,
+                "content": str(message["value"]),
+            }
+        )
+
+    prompt = render_chat_prompt(
+        messages=messages,
+        tokenizer=tokenizer,
+        model_path=model_name,
+        add_generation_prompt=False,
+    )
+
+    token_ids = tokenizer(
+        prompt,
+        truncation=False,
+        add_special_tokens=not is_qwen3_model(model_name),
+    ).input_ids
+
+    return len(token_ids)
+
+
+def _add_attempt_memory_to_critic_conversation(
+    base_conversation: Sequence[Mapping[str, Any]],
+    *,
+    previous_attempts: Sequence[Mapping[str, Any]],
+    mode: str,
+    tokenizer: Any,
+    model_name: str,
+    max_prompt_tokens: int,
+) -> tuple[List[Dict[str, str]], Dict[str, Any]]:
+    conversation = copy.deepcopy(list(base_conversation))
+
+    base_tokens = _count_qnet_conversation_tokens(
+        conversation,
+        tokenizer=tokenizer,
+        model_name=model_name,
+    )
+
+    diagnostics = {
+        "attempt_memory_mode": mode,
+        "attempt_memory_used": False,
+        "attempt_memory_num_previous": 0,
+        "qnet_prompt_token_cap": int(max_prompt_tokens),
+        "qnet_prompt_tokens_without_attempt_memory": int(base_tokens),
+        "qnet_prompt_tokens_with_attempt_memory": int(base_tokens),
+        "qnet_prompt_tokens_added_by_attempt_memory": 0,
+        "qnet_prompt_overflow_tokens": 0,
+        "qnet_prompt_would_truncate": False,
+        "attempt_memory_retention_ratio": 1.0,
+    }
+
+    # Crucial: attempt 0 goes through exactly the baseline input.
+    if mode == "none" or not previous_attempts:
+        return conversation, diagnostics
+
+    if base_tokens > max_prompt_tokens:
+        raise RuntimeError(
+            "Current QNet state/action prompt already exceeds the configured token cap before attempt memory is added: "
+            f"{base_tokens} > {max_prompt_tokens}."
+        )
+
+    memory_text = _serialize_critic_attempt_memory(
+        previous_attempts,
+        mode=mode,
+    )
+
+    if len(conversation) != 2:
+        raise ValueError(
+            "Attempt memory currently expects the Qwen ReAct critic format: one human state + one gpt action."
+        )
+
+    if conversation[0]["from"] != "human" or conversation[1]["from"] != "gpt":
+        raise ValueError("Unexpected Qwen ReAct critic conversation.")
+
+    current_state = conversation[0]["value"]
+
+    # Current state is copied VERBATIM and remains at the end of the human message.
+    conversation[0]["value"] = f"{memory_text}\n\n{current_state}"
+
+    full_tokens = _count_qnet_conversation_tokens(
+        conversation,
+        tokenizer=tokenizer,
+        model_name=model_name,
+    )
+
+    added_tokens = max(full_tokens - base_tokens, 0)
+    overflow_tokens = max(full_tokens - max_prompt_tokens, 0)
+
+    retained_memory_tokens = min(
+        added_tokens,
+        max(max_prompt_tokens - base_tokens, 0),
+    )
+
+    retention_ratio = (
+        retained_memory_tokens / added_tokens if added_tokens > 0 else 1.0
+    )
+
+    diagnostics.update(
+        {
+            "attempt_memory_used": True,
+            "attempt_memory_num_previous": len(previous_attempts),
+            "attempt_memory_chars": len(memory_text),
+            "qnet_prompt_tokens_with_attempt_memory": int(full_tokens),
+            "qnet_prompt_tokens_added_by_attempt_memory": int(added_tokens),
+            "qnet_prompt_overflow_tokens": int(overflow_tokens),
+            "qnet_prompt_would_truncate": bool(full_tokens > max_prompt_tokens),
+            "attempt_memory_retention_ratio": float(retention_ratio),
+        }
+    )
+
+    return conversation, diagnostics
+
+
 def _score_candidate_base(
     *,
     critic_backend: str,
@@ -572,6 +787,7 @@ def _score_candidate_base(
     qnet_model_name: Optional[str],
     critic_conversation: Optional[List[Dict[str, str]]],
     llm_critic: Optional[Any],
+    qnet_prompt_diagnostics: Optional[Dict[str, Any]],
 ) -> tuple[
     float,
     str,
@@ -617,7 +833,7 @@ def _score_candidate_base(
             )[0]
         )
 
-        return score, "qnet", None
+        return score, "qnet", dict(qnet_prompt_diagnostics or {}),
 
     if critic_backend == "llm_judge":
         if llm_critic is None:
@@ -946,6 +1162,19 @@ def main(args):
 
         if args.num_icl_examples != 0:
             raise ValueError("ALFWorld ReAct mode requires --num_icl_examples=0.")
+
+    if args.critic_attempt_memory_num_previous <= 0:
+        raise ValueError("--critic_attempt_memory_num_previous must be positive.")
+
+    if args.critic_attempt_memory_mode != "none":
+        if args.critic_backend != "qnet":
+            raise ValueError("Critic attempt memory MVP currently supports only --critic_backend=qnet.")
+
+        if not args.alfworld_react_prompt:
+            raise ValueError("Critic attempt memory MVP currently requires --alfworld_react_prompt.")
+
+        if args.exp_config != "alfworld":
+            raise ValueError("Critic attempt memory MVP currently supports only ALFWorld.")
 
     if args.enable_memory_action_augmentation and not args.enable_memory_correction:
         raise ValueError(
@@ -1389,6 +1618,15 @@ def main(args):
                 # trajectory. Temporary candidate branches evaluated by QNet
                 # are never inserted into episodic memory.
                 executed_steps: List[Dict[str, Any]] = []
+
+                critic_attempt_steps: List[Dict[str, Any]] = []
+                if args.critic_attempt_memory_mode == "none":
+                    previous_critic_attempts = []
+                else:
+                    previous_trajs = all_trajs[-args.critic_attempt_memory_num_previous:]
+
+                    previous_critic_attempts = [traj["critic_attempt_trace"] for traj in previous_trajs]
+
                 action_value_list = []
                 steps_with_nonzero_correction = 0
                 argmax_changed_by_correction = 0
@@ -1517,9 +1755,21 @@ def main(args):
                         )
 
                         critic_conversation = None
+                        critic_prompt_diagnostics = None
+
                         if args.alfworld_react_prompt and args.critic_backend == "qnet":
-                            critic_conversation = (
-                                _build_react_qnet_conversation(actor_messages=cur_state_history, raw_action=raw_action)
+                            base_critic_conversation = _build_react_qnet_conversation(
+                                actor_messages=cur_state_history,
+                                raw_action=raw_action,
+                            )
+
+                            critic_conversation, critic_prompt_diagnostics = _add_attempt_memory_to_critic_conversation(
+                                base_critic_conversation,
+                                previous_attempts=previous_critic_attempts,
+                                mode=args.critic_attempt_memory_mode,
+                                tokenizer=qnet_tokenizer,
+                                model_name=qnet_model_name,
+                                max_prompt_tokens=args.qnet_max_prompt_tokens,
                             )
 
                         observation_after_action, new_state = env.step(raw_action)
@@ -1534,6 +1784,7 @@ def main(args):
                             qnet_model_name=qnet_model_name,
                             critic_conversation=critic_conversation,
                             llm_critic=llm_critic,
+                            qnet_prompt_diagnostics=critic_prompt_diagnostics,
                         )
 
                         if i < 2 and n_turn < 3:
@@ -1645,16 +1896,26 @@ def main(args):
                             )
 
                             critic_conversation = None
+                            critic_prompt_diagnostics = None
                             if args.alfworld_react_prompt and args.critic_backend == "qnet":
                                 critic_state_messages = (
                                     env.build_react_actor_messages(history_length=args.alfworld_history_length)
                                 )
 
-                                critic_conversation = (
+                                base_critic_conversation = (
                                     _build_react_qnet_conversation(
                                         actor_messages=critic_state_messages,
                                         raw_action=raw_action,
                                     )
+                                )
+
+                                critic_conversation, critic_prompt_diagnostics = _add_attempt_memory_to_critic_conversation(
+                                    base_critic_conversation,
+                                    previous_attempts=previous_critic_attempts,
+                                    mode=args.critic_attempt_memory_mode,
+                                    tokenizer=qnet_tokenizer,
+                                    model_name=qnet_model_name,
+                                    max_prompt_tokens=args.qnet_max_prompt_tokens,
                                 )
 
                             observation_after_action, new_state = env.step(raw_action)
@@ -1671,6 +1932,7 @@ def main(args):
                                 qnet_model_name=qnet_model_name,
                                 critic_conversation=critic_conversation,
                                 llm_critic=llm_critic,
+                                qnet_prompt_diagnostics=critic_prompt_diagnostics,
                             )
 
                             candidate_records.append(
@@ -1916,6 +2178,26 @@ def main(args):
                     for candidate_idx, record in enumerate(candidate_records):
                         record["selected"] = candidate_idx == selected_idx
 
+                    critic_attempt_steps.append(
+                        {
+                            "step_id": int(n_turn),
+                            "observation_before_action": str(observation_before_action),
+                            "candidates": [
+                                {
+                                    "candidate_id": int(record["candidate_id"]),
+                                    "action_command": str(record["action_command"]),
+                                    "base_score": float(record["base_score"]),
+                                    "score_source": str(record["score_source"]),
+                                    "candidate_source": str(record["candidate_source"]),
+                                    "selected": bool(record["selected"]),
+                                }
+                                for record in candidate_records
+                            ],
+                            "selected_action": str(selected_record["action_command"]),
+                            "observation_after_action": str(selected_record["observation_after_action"]),
+                        }
+                    )
+
                     # Preserve the old ``value`` field as the base QNet score,
                     # and save correction diagnostics alongside it.
                     action_value_dict = [
@@ -2118,6 +2400,16 @@ def main(args):
                     "attempt_id": traj_id,
                     "num_steps": int(cur_traj_state.steps),
                     "terminate_reason": (cur_traj_state.terminate_reason),
+
+                    "critic_attempt_trace": {
+                        "attempt_id": int(traj_id),
+                        "steps": critic_attempt_steps,
+                        "success": bool(cur_traj_state.success),
+                        "final_reward": _safe_float(cur_traj_state.reward),
+                        "terminate_reason": (cur_traj_state.terminate_reason),
+                    },
+                    "critic_attempt_memory_mode": args.critic_attempt_memory_mode,
+                    "critic_attempt_memory_num_previous": args.critic_attempt_memory_num_previous,
                 }
                 if correction_memory is not None:
                     trajectory_record["memory_correction_summary"] = {
@@ -2405,11 +2697,26 @@ if __name__ == "__main__":
         ),
     )
     parser.add_argument("--qnet_max_prompt_tokens", type=int, default=3800,
-                        help="Max prompt tokens for QNet scoring (message-level trimming).")
+                        help="Hard token cap for QNet input. The Qwen ReAct path uses left token truncation.")
     parser.add_argument("--qnet_keep_first_n", type=int, default=3,
                         help="Keep first N messages when trimming for QNet scoring.")
     parser.add_argument("--qnet_min_tail_msgs", type=int, default=4,
                         help="Keep at least this many last messages when trimming for QNet scoring.")
+
+    parser.add_argument("--critic_attempt_memory_mode", type=str,
+        choices=["none", "trajectory", "trajectory_with_scores"],
+        default="none",
+        help=(
+            "Task-local previous-attempt context given only to the QNet critic. 'trajectory' includes executed "
+            "observation/action transitions and final outcome; 'trajectory_with_scores' additionally includes "
+            "previous candidate actions and their base scores."
+        ),
+    )
+
+    parser.add_argument(
+        "--critic_attempt_memory_num_previous", type=int, default=1,
+        help="Maximum number of most recent attempts of the same task included in the critic prompt.",
+    )
 
     parser.add_argument(
         "--policy_max_prompt_tokens",
